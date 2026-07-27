@@ -1,2 +1,0 @@
-rubka
-python-dotenv
