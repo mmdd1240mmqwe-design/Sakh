@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
- VANTA PERSIA BOT — v2  (تک‌فایلی: bot.py — همینو رو گیت‌هاب بذار)
-================================================================================
-راه‌اندازی سریع:
-    pip install rubka python-dotenv Pillow
-    cp .env.example .env      (توکن و آیدی ادمین‌ها رو توش بذار)
-    python bot.py
-================================================================================
+VANTA PERSIA BOT — v2 (تک‌فایلی: bot.py)
+pip install rubka python-dotenv Pillow
+cp .env.example .env
+python bot.py
 """
 
 import os
@@ -161,6 +157,63 @@ def init_db():
                 value TEXT
             )
         """)
+
+        # ---- بازار سیاه (Black Market) ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_uid TEXT,
+                item_name TEXT,
+                category TEXT,
+                qty INTEGER DEFAULT 1,
+                price INTEGER,
+                is_auction INTEGER DEFAULT 0,
+                auction_end_ts INTEGER DEFAULT 0,
+                current_bid INTEGER DEFAULT 0,
+                current_bidder TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',   -- active | sold | cancelled | expired
+                listed_at INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_uid TEXT,
+                buyer_uid TEXT,
+                item_name TEXT,
+                price INTEGER,
+                tax INTEGER,
+                timestamp INTEGER
+            )
+        """)
+
+        # ---- کلن/گیلد ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                owner_uid TEXT,
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clan_members (
+                clan_id INTEGER,
+                uid TEXT,
+                joined_at INTEGER DEFAULT 0,
+                PRIMARY KEY (clan_id, uid)
+            )
+        """)
+
+        # ---- دستاوردها ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_achievements (
+                uid TEXT,
+                achievement_key TEXT,
+                unlocked_at INTEGER DEFAULT 0,
+                PRIMARY KEY (uid, achievement_key)
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_items (
                 uid TEXT,
@@ -276,6 +329,12 @@ def increment_messages(uid):
         cur.execute("UPDATE users SET messages = messages + 1 WHERE uid=?", (str(uid),))
 
 
+def increment_wins(uid, amount=1):
+    get_user(uid)
+    with write_cursor() as cur:
+        cur.execute("UPDATE users SET wins = wins + ?, games = games + 1 WHERE uid=?", (amount, str(uid)))
+
+
 def reset_user(uid):
     uid = str(uid)
     with write_cursor() as cur:
@@ -333,6 +392,43 @@ def has_item(uid, category, item_name):
         (uid, category, item_name),
     ).fetchone()
     return bool(row and row["qty"] > 0)
+
+
+def remove_item(uid, category, item_name, qty=1):
+    """qty رو از این آیتم کم می‌کنه؛ اگه به صفر برسه، ردیفش کامل حذف میشه.
+    اگه موجودی کافی نبود، False برمی‌گردونه و چیزی تغییر نمی‌کنه."""
+    uid = str(uid)
+    cur = read_cursor()
+    row = cur.execute(
+        "SELECT qty FROM user_items WHERE uid=? AND category=? AND item_name=?",
+        (uid, category, item_name),
+    ).fetchone()
+    if not row or row["qty"] < qty:
+        return False
+    with write_cursor() as wcur:
+        if row["qty"] == qty:
+            wcur.execute(
+                "DELETE FROM user_items WHERE uid=? AND category=? AND item_name=?",
+                (uid, category, item_name),
+            )
+        else:
+            wcur.execute(
+                "UPDATE user_items SET qty = qty - ? WHERE uid=? AND category=? AND item_name=?",
+                (qty, uid, category, item_name),
+            )
+    return True
+
+
+def find_owned_item(uid, item_name):
+    """این آیتم رو تو هر دسته‌ای که کاربر داشته باشه پیدا می‌کنه (برای هدیه/بازار
+    که کاربر لازم نیست دسته رو بدونه). برمی‌گردونه dict آیتم یا None."""
+    uid = str(uid)
+    cur = read_cursor()
+    row = cur.execute(
+        "SELECT * FROM user_items WHERE uid=? AND item_name=? AND qty>0 LIMIT 1",
+        (uid, item_name),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 # ============================================================================
@@ -551,8 +647,203 @@ def increment_global_counter(key):
     return new_val
 
 
+# ============================================================================
+# 🖤 بازار سیاه (Black Market)
+# ============================================================================
+MARKET_TAX_RATE = 0.05  # ۵٪ مالیات از قیمت فروش کم میشه (برای جلوگیری از تورم/سوءاستفاده)
+
+
+def create_listing(seller_uid, item_name, category, qty, price, is_auction=False, auction_minutes=0):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO market_listings
+                (seller_uid, item_name, category, qty, price, is_auction, auction_end_ts, current_bid, listed_at, status)
+            VALUES (?,?,?,?,?,?,?,?,?, 'active')
+        """, (
+            str(seller_uid), item_name, category, qty, price,
+            1 if is_auction else 0,
+            int(time.time() + auction_minutes * 60) if is_auction else 0,
+            price if is_auction else 0,
+            int(time.time()),
+        ))
+        new_id = cur.lastrowid
+    return new_id
+
+
+def get_listing(listing_id):
+    cur = read_cursor()
+    row = cur.execute("SELECT * FROM market_listings WHERE id=?", (listing_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_active_listings(limit=15, category=None, item_name_contains=None):
+    cur = read_cursor()
+    query = "SELECT * FROM market_listings WHERE status='active'"
+    params = []
+    if category:
+        query += " AND category=?"
+        params.append(category)
+    if item_name_contains:
+        query += " AND item_name LIKE ?"
+        params.append(f"%{item_name_contains}%")
+    query += " ORDER BY listed_at DESC LIMIT ?"
+    params.append(limit)
+    rows = cur.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_listing_status(listing_id, status):
+    with write_cursor() as cur:
+        cur.execute("UPDATE market_listings SET status=? WHERE id=?", (status, listing_id))
+
+
+def update_listing_bid(listing_id, bid_amount, bidder_uid):
+    with write_cursor() as cur:
+        cur.execute(
+            "UPDATE market_listings SET current_bid=?, current_bidder=? WHERE id=?",
+            (bid_amount, str(bidder_uid), listing_id),
+        )
+
+
+def get_expired_active_auctions():
+    cur = read_cursor()
+    rows = cur.execute(
+        "SELECT * FROM market_listings WHERE status='active' AND is_auction=1 AND auction_end_ts>0 AND auction_end_ts<=?",
+        (int(time.time()),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def log_transaction(seller_uid, buyer_uid, item_name, price, tax):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO market_transactions (seller_uid, buyer_uid, item_name, price, tax, timestamp)
+            VALUES (?,?,?,?,?,?)
+        """, (str(seller_uid), str(buyer_uid), item_name, price, tax, int(time.time())))
+
+
+def get_user_transaction_history(uid, limit=10):
+    uid = str(uid)
+    cur = read_cursor()
+    rows = cur.execute("""
+        SELECT * FROM market_transactions WHERE seller_uid=? OR buyer_uid=?
+        ORDER BY timestamp DESC LIMIT ?
+    """, (uid, uid, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# 🛡️ کلن/گیلد
+# ============================================================================
+def create_clan(name, owner_uid):
+    with write_cursor() as cur:
+        cur.execute(
+            "INSERT INTO clans (name, owner_uid, created_at) VALUES (?,?,?)",
+            (name, str(owner_uid), int(time.time())),
+        )
+        clan_id = cur.lastrowid
+        cur.execute(
+            "INSERT OR IGNORE INTO clan_members (clan_id, uid, joined_at) VALUES (?,?,?)",
+            (clan_id, str(owner_uid), int(time.time())),
+        )
+    return clan_id
+
+
+def get_clan_by_name(name):
+    cur = read_cursor()
+    row = cur.execute("SELECT * FROM clans WHERE name=?", (name,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_clan(uid):
+    cur = read_cursor()
+    row = cur.execute("""
+        SELECT clans.* FROM clans
+        JOIN clan_members ON clans.id = clan_members.clan_id
+        WHERE clan_members.uid=?
+    """, (str(uid),)).fetchone()
+    return dict(row) if row else None
+
+
+def join_clan(clan_id, uid):
+    with write_cursor() as cur:
+        cur.execute(
+            "INSERT OR IGNORE INTO clan_members (clan_id, uid, joined_at) VALUES (?,?,?)",
+            (clan_id, str(uid), int(time.time())),
+        )
+
+
+def leave_clan(clan_id, uid):
+    with write_cursor() as cur:
+        cur.execute("DELETE FROM clan_members WHERE clan_id=? AND uid=?", (clan_id, str(uid)))
+
+
+def get_clan_members(clan_id):
+    cur = read_cursor()
+    rows = cur.execute("SELECT uid FROM clan_members WHERE clan_id=?", (clan_id,)).fetchall()
+    return [r["uid"] for r in rows]
+
+
+def all_clans(limit=20):
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM clans ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# 🏅 دستاوردها
+# ============================================================================
+def unlock_achievement(uid, achievement_key):
+    """اگه از قبل باز نشده باشه، باز می‌کنه. برمی‌گردونه True اگه تازه باز شد."""
+    uid = str(uid)
+    cur = read_cursor()
+    existing = cur.execute(
+        "SELECT 1 FROM user_achievements WHERE uid=? AND achievement_key=?", (uid, achievement_key)
+    ).fetchone()
+    if existing:
+        return False
+    with write_cursor() as wcur:
+        wcur.execute(
+            "INSERT OR IGNORE INTO user_achievements (uid, achievement_key, unlocked_at) VALUES (?,?,?)",
+            (uid, achievement_key, int(time.time())),
+        )
+    return True
+
+
+def get_user_achievements(uid):
+    cur = read_cursor()
+    rows = cur.execute(
+        "SELECT achievement_key FROM user_achievements WHERE uid=?", (str(uid),)
+    ).fetchall()
+    return [r["achievement_key"] for r in rows]
+
+
+# ============================================================================
+# 🏆 لیدربوردهای اضافی
+# ============================================================================
+def top_users_by_coins(limit=10):
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM users ORDER BY coins DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def top_users_by_wins(limit=10):
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM users ORDER BY wins DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def top_users_by_item_count(limit=10):
+    cur = read_cursor()
+    rows = cur.execute("""
+        SELECT uid, SUM(qty) as total_items FROM user_items
+        GROUP BY uid ORDER BY total_items DESC LIMIT ?
+    """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ==============================================================================
-# بخش ۳: محتوای ثابت (مود، فروشگاه، معما، پارتی و...)
+# بخش ۳: محتوای ثابت + کاتالوگ آیتم‌ها
 # ==============================================================================
 # =============================================================================
 # 🎭 سیستم مود - ۱۲ مود متنوع، لحن‌های بزرگسال‌تر و کمتر بچگانه
@@ -877,8 +1168,45 @@ PARTY_HYPE_MESSAGES = [
     "همه بیدار شید!! سکه و XP دارن می‌بارن از آسمون 🌧️💰",
     "این یه پارتی معمولی نیست، یه پارتی وانتاپرسیاییه 👑🎉",
     "بجنبید بجنبید، فرصت طلایی همینجاست ⏰✨",
+    "🎮 LEVEL UP MODE: فعال! همه‌چی الان دوبرابر ارزش داره!",
+    "⚡ سرور رو داغ کنید! پارتی ماشین جنگیه، وقت تلف نکنید!",
+    "🏆 BOSS FIGHT همین الان شروع میشه، آماده‌ی نبرد باشید!",
+    "💎 LOOT DROP فعال شد! هرکی بجنبه بیشتر می‌بره!",
+    "🚨 هشدار: سطح هیجان بحرانیه! ورود ممنوع برای آدمای آروم 😎",
+    "🔊 صدای بیت رو زیاد کنید، امشب شب ماست!",
+    "🎯 کامبو بزنید! هرچی بیشتر بازی کنید بیشتر می‌گیرید!",
+    "🥁 طبل جنگ به صدا دراومد، همه بریزید وسط!",
+    "🌪 طوفان جایزه راه افتاده، کسی جا نمونه!",
+    "🔥 STREAK ACTIVE: تا وقتی پارتیه دست نگه ندارید!",
+    "🕹 هرکی گیمرتره بیشتر می‌بره، ثابت کنید!",
+    "💥 انفجار جایزه شروع شد، همه بدوئید سمت بازیا!",
+    "🎊 امشب شب طلاست، دستکش‌هاتونو بپوشید و بریزید تو میدون!",
+    "🚀 موشک پارتی پرتاب شد! تا وقتی زمانش هست، فول‌گاز برید جلو!",
 ]
-PARTY_DANCE_EMOJIS = ["💃", "🕺", "🎉", "🥳", "✨", "🎊", "🍾", "🎶"]
+PARTY_DANCE_EMOJIS = ["💃", "🕺", "🎉", "🥳", "✨", "🎊", "🍾", "🎶", "🔥", "⚡"]
+
+# «بیت دراپ» متنی - جایگزین آهنگ واقعی (نمی‌تونیم فایل صوتی/کپی‌رایتی بفرستیم)
+PARTY_BEAT_DROP = [
+    "🎶 بووم بووم بووم... 🥁🥁🥁 ...و ریتم فانک می‌زنه: بکـ بکـ بکـ‌بکـ! 🕺💃",
+    "🎧 چـکـ چـکـ چـکـ... بیس دراپ! 💥 بزن‌وبکوب شروع شد 🔊🔥",
+    "🎵 دام دام دام تیش! دام دام دام تیش! ریتم فانک رو حس کنید 🕺",
+    "🥁 بیت گرفت! پـام پـام پـادام‌پام! برقصید تا ته خط 💃🔥",
+]
+
+# =============================================================================
+# 👹 نبرد رئیس (Boss Battle) - فقط موقع پارتی، همه با هم به یه باس حمله می‌کنن
+# =============================================================================
+BOSS_NAMES = [
+    "اژدهای آتشین ویرانگر 🐉🔥", "کریکن غول‌پیکر اعماق 🐙🌊",
+    "شوالیه‌ی سیاه نفرین‌شده ⚔️🖤", "دیو یخی ابدی ❄️👹",
+    "ققنوس خشم شعله‌ور 🔥🦅", "گارگویل سنگی کهن 🗿⚡",
+]
+BOSS_HP_BASE = 3000
+BOSS_ATTACK_MIN, BOSS_ATTACK_MAX = 80, 220
+BOSS_ATTACK_MESSAGES = [
+    "⚔️ ضربه محکم زدی!", "🔥 یه ترکیب آتشین کوبیدی!", "💥 ضربه‌ی کریتیکال!",
+    "🗡 شمشیرت رو فرو کردی!", "🏹 تیر دقیقی زدی!", "👊 مشت سنگینی حواله‌ش کردی!",
+]
 
 # جوایز «چرخ شانس پارتی» - فقط موقع پارتی فعاله
 PARTY_WHEEL_PRIZES = [
@@ -1120,6 +1448,1359 @@ JOKES = [
     "معلم میگه: چرا انشات کوتاهه؟\nبچه میگه: چون موضوعش «مختصر و مفید بنویسید» بود 😂",
     "دو تا دوست تو اتوبوس، یکی میگه چقدر این اتوبوس کنده.\nاون یکی میگه: خب نگاه کن، پیاده‌روا از ما جلوتر رفتن 😂",
 ]
+# =============================================================================
+# 🗃️ کاتالوگ آیتم‌های اسپاون - بیش از ۱۳۰۰ آیتم واقعی، تولید شده با seed ثابت
+# (seed ثابته که کمیابی/قیمت هر آیتم بین ری‌استارت‌های ربات عوض نشه)
+# =============================================================================
+RARITY_INFO = {
+    "Common":    {"label": "⚪ Common",    "spawn_weight": 4000, "value_mult": 1},
+    "Uncommon":  {"label": "🟢 Uncommon",  "spawn_weight": 2500, "value_mult": 2},
+    "Rare":      {"label": "🔵 Rare",      "spawn_weight": 1500, "value_mult": 4},
+    "Epic":      {"label": "🟣 Epic",      "spawn_weight": 1000, "value_mult": 8},
+    "Legendary": {"label": "🟠 Legendary", "spawn_weight": 600,  "value_mult": 15},
+    "Mythic":    {"label": "🔴 Mythic",    "spawn_weight": 300,  "value_mult": 30},
+    "God":       {"label": "🟡 God",       "spawn_weight": 70,   "value_mult": 60},
+    "Secret":    {"label": "⚫ Secret",     "spawn_weight": 25,   "value_mult": 120},
+    "OG":        {"label": "🌟 OG",        "spawn_weight": 0,    "value_mult": 1000},
+}
+
+# فقط یک نسخه در کل بازی - آیتم افسانه‌ای OG (وضعیتش تو bot_state پیگیری میشه: og_claimed)
+OG_ITEM = {"name": "تاج ازلی وانتاپرسیا 🌟👑", "category": "افسانه‌ای", "rarity": "OG", "price": 1000000, "xp": 50000, "tradeable": True}
+
+ITEM_CATALOG = [
+    {"name": 'کشاورز پیر', "category": 'انسان', "rarity": 'Uncommon', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'شکارچی پیر', "category": 'انسان', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'جادوگر پیر', "category": 'انسان', "rarity": 'Rare', "price": 334, "xp": 22, "tradeable": True},
+    {"name": 'شوالیه پیر', "category": 'انسان', "rarity": 'Uncommon', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'دزد پیر', "category": 'انسان', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'کیمیاگر پیر', "category": 'انسان', "rarity": 'Rare', "price": 399, "xp": 26, "tradeable": True},
+    {"name": 'ناخدا پیر', "category": 'انسان', "rarity": 'Uncommon', "price": 156, "xp": 10, "tradeable": True},
+    {"name": 'کوهنورد پیر', "category": 'انسان', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'پیک پیر', "category": 'انسان', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'نگهبان پیر', "category": 'انسان', "rarity": 'Rare', "price": 145, "xp": 9, "tradeable": True},
+    {"name": 'راهزن پیر', "category": 'انسان', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'طبیب پیر', "category": 'انسان', "rarity": 'Epic', "price": 751, "xp": 50, "tradeable": True},
+    {"name": 'خنیاگر پیر', "category": 'انسان', "rarity": 'Mythic', "price": 1964, "xp": 130, "tradeable": True},
+    {"name": 'زائر پیر', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'سرباز پیر', "category": 'انسان', "rarity": 'Rare', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'کاشف پیر', "category": 'انسان', "rarity": 'Rare', "price": 196, "xp": 13, "tradeable": True},
+    {"name": 'کشاورز جوان', "category": 'انسان', "rarity": 'Epic', "price": 585, "xp": 39, "tradeable": True},
+    {"name": 'شکارچی جوان', "category": 'انسان', "rarity": 'Uncommon', "price": 133, "xp": 8, "tradeable": True},
+    {"name": 'جادوگر جوان', "category": 'انسان', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'شوالیه جوان', "category": 'انسان', "rarity": 'Rare', "price": 172, "xp": 11, "tradeable": True},
+    {"name": 'دزد جوان', "category": 'انسان', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'کیمیاگر جوان', "category": 'انسان', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'ناخدا جوان', "category": 'انسان', "rarity": 'Epic', "price": 270, "xp": 18, "tradeable": True},
+    {"name": 'کوهنورد جوان', "category": 'انسان', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'پیک جوان', "category": 'انسان', "rarity": 'Common', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'نگهبان جوان', "category": 'انسان', "rarity": 'Uncommon', "price": 153, "xp": 10, "tradeable": True},
+    {"name": 'راهزن جوان', "category": 'انسان', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'طبیب جوان', "category": 'انسان', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'خنیاگر جوان', "category": 'انسان', "rarity": 'God', "price": 2974, "xp": 198, "tradeable": True},
+    {"name": 'زائر جوان', "category": 'انسان', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'سرباز جوان', "category": 'انسان', "rarity": 'Common', "price": 59, "xp": 3, "tradeable": True},
+    {"name": 'کاشف جوان', "category": 'انسان', "rarity": 'Uncommon', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 189, "xp": 12, "tradeable": True},
+    {"name": 'شکارچی رازآلود', "category": 'انسان', "rarity": 'Mythic', "price": 1060, "xp": 70, "tradeable": True},
+    {"name": 'جادوگر رازآلود', "category": 'انسان', "rarity": 'Common', "price": 115, "xp": 7, "tradeable": True},
+    {"name": 'شوالیه رازآلود', "category": 'انسان', "rarity": 'Rare', "price": 249, "xp": 16, "tradeable": True},
+    {"name": 'دزد رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 141, "xp": 9, "tradeable": True},
+    {"name": 'کیمیاگر رازآلود', "category": 'انسان', "rarity": 'Rare', "price": 324, "xp": 21, "tradeable": True},
+    {"name": 'ناخدا رازآلود', "category": 'انسان', "rarity": 'Rare', "price": 472, "xp": 31, "tradeable": True},
+    {"name": 'کوهنورد رازآلود', "category": 'انسان', "rarity": 'Epic', "price": 664, "xp": 44, "tradeable": True},
+    {"name": 'پیک رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'نگهبان رازآلود', "category": 'انسان', "rarity": 'Rare', "price": 505, "xp": 33, "tradeable": True},
+    {"name": 'راهزن رازآلود', "category": 'انسان', "rarity": 'Legendary', "price": 494, "xp": 32, "tradeable": True},
+    {"name": 'طبیب رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'خنیاگر رازآلود', "category": 'انسان', "rarity": 'Epic', "price": 507, "xp": 33, "tradeable": True},
+    {"name": 'زائر رازآلود', "category": 'انسان', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'سرباز رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'کاشف رازآلود', "category": 'انسان', "rarity": 'Uncommon', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز گمنام', "category": 'انسان', "rarity": 'Uncommon', "price": 176, "xp": 11, "tradeable": True},
+    {"name": 'شکارچی گمنام', "category": 'انسان', "rarity": 'Uncommon', "price": 215, "xp": 14, "tradeable": True},
+    {"name": 'جادوگر گمنام', "category": 'انسان', "rarity": 'Legendary', "price": 954, "xp": 63, "tradeable": True},
+    {"name": 'شوالیه گمنام', "category": 'انسان', "rarity": 'Common', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'دزد گمنام', "category": 'انسان', "rarity": 'Uncommon', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'کیمیاگر گمنام', "category": 'انسان', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'ناخدا گمنام', "category": 'انسان', "rarity": 'Common', "price": 46, "xp": 3, "tradeable": True},
+    {"name": 'کوهنورد گمنام', "category": 'انسان', "rarity": 'Rare', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'پیک گمنام', "category": 'انسان', "rarity": 'Legendary', "price": 902, "xp": 60, "tradeable": True},
+    {"name": 'نگهبان گمنام', "category": 'انسان', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'راهزن گمنام', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'طبیب گمنام', "category": 'انسان', "rarity": 'Uncommon', "price": 146, "xp": 9, "tradeable": True},
+    {"name": 'خنیاگر گمنام', "category": 'انسان', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'زائر گمنام', "category": 'انسان', "rarity": 'Uncommon', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'سرباز گمنام', "category": 'انسان', "rarity": 'Mythic', "price": 1046, "xp": 69, "tradeable": True},
+    {"name": 'کاشف گمنام', "category": 'انسان', "rarity": 'Rare', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'کشاورز افسانه\u200cای', "category": 'انسان', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'شکارچی افسانه\u200cای', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'جادوگر افسانه\u200cای', "category": 'انسان', "rarity": 'Legendary', "price": 1553, "xp": 103, "tradeable": True},
+    {"name": 'شوالیه افسانه\u200cای', "category": 'انسان', "rarity": 'Epic', "price": 277, "xp": 18, "tradeable": True},
+    {"name": 'دزد افسانه\u200cای', "category": 'انسان', "rarity": 'Secret', "price": 4778, "xp": 318, "tradeable": True},
+    {"name": 'کیمیاگر افسانه\u200cای', "category": 'انسان', "rarity": 'Legendary', "price": 794, "xp": 52, "tradeable": True},
+    {"name": 'ناخدا افسانه\u200cای', "category": 'انسان', "rarity": 'Uncommon', "price": 140, "xp": 9, "tradeable": True},
+    {"name": 'کوهنورد افسانه\u200cای', "category": 'انسان', "rarity": 'Legendary', "price": 756, "xp": 50, "tradeable": True},
+    {"name": 'پیک افسانه\u200cای', "category": 'انسان', "rarity": 'Mythic', "price": 2387, "xp": 159, "tradeable": True},
+    {"name": 'نگهبان افسانه\u200cای', "category": 'انسان', "rarity": 'Rare', "price": 267, "xp": 17, "tradeable": True},
+    {"name": 'راهزن افسانه\u200cای', "category": 'انسان', "rarity": 'Legendary', "price": 1210, "xp": 80, "tradeable": True},
+    {"name": 'طبیب افسانه\u200cای', "category": 'انسان', "rarity": 'Common', "price": 40, "xp": 2, "tradeable": True},
+    {"name": 'خنیاگر افسانه\u200cای', "category": 'انسان', "rarity": 'Uncommon', "price": 116, "xp": 7, "tradeable": True},
+    {"name": 'زائر افسانه\u200cای', "category": 'انسان', "rarity": 'Uncommon', "price": 236, "xp": 15, "tradeable": True},
+    {"name": 'سرباز افسانه\u200cای', "category": 'انسان', "rarity": 'Uncommon', "price": 94, "xp": 6, "tradeable": True},
+    {"name": 'کاشف افسانه\u200cای', "category": 'انسان', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'کشاورز سرگردان', "category": 'انسان', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'شکارچی سرگردان', "category": 'انسان', "rarity": 'Legendary', "price": 996, "xp": 66, "tradeable": True},
+    {"name": 'جادوگر سرگردان', "category": 'انسان', "rarity": 'Common', "price": 40, "xp": 2, "tradeable": True},
+    {"name": 'شوالیه سرگردان', "category": 'انسان', "rarity": 'Uncommon', "price": 183, "xp": 12, "tradeable": True},
+    {"name": 'دزد سرگردان', "category": 'انسان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'کیمیاگر سرگردان', "category": 'انسان', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'ناخدا سرگردان', "category": 'انسان', "rarity": 'Legendary', "price": 470, "xp": 31, "tradeable": True},
+    {"name": 'کوهنورد سرگردان', "category": 'انسان', "rarity": 'Uncommon', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'پیک سرگردان', "category": 'انسان', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'نگهبان سرگردان', "category": 'انسان', "rarity": 'Common', "price": 47, "xp": 3, "tradeable": True},
+    {"name": 'راهزن سرگردان', "category": 'انسان', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'طبیب سرگردان', "category": 'انسان', "rarity": 'Uncommon', "price": 150, "xp": 10, "tradeable": True},
+    {"name": 'خنیاگر سرگردان', "category": 'انسان', "rarity": 'Mythic', "price": 2339, "xp": 155, "tradeable": True},
+    {"name": 'زائر سرگردان', "category": 'انسان', "rarity": 'Epic', "price": 688, "xp": 45, "tradeable": True},
+    {"name": 'سرباز سرگردان', "category": 'انسان', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'کاشف سرگردان', "category": 'انسان', "rarity": 'Epic', "price": 702, "xp": 46, "tradeable": True},
+    {"name": 'کشاورز دانا', "category": 'انسان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'شکارچی دانا', "category": 'انسان', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'جادوگر دانا', "category": 'انسان', "rarity": 'Common', "price": 30, "xp": 2, "tradeable": True},
+    {"name": 'شوالیه دانا', "category": 'انسان', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'دزد دانا', "category": 'انسان', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'کیمیاگر دانا', "category": 'انسان', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'ناخدا دانا', "category": 'انسان', "rarity": 'Uncommon', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'کوهنورد دانا', "category": 'انسان', "rarity": 'Legendary', "price": 788, "xp": 52, "tradeable": True},
+    {"name": 'پیک دانا', "category": 'انسان', "rarity": 'Epic', "price": 699, "xp": 46, "tradeable": True},
+    {"name": 'نگهبان دانا', "category": 'انسان', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'راهزن دانا', "category": 'انسان', "rarity": 'Legendary', "price": 655, "xp": 43, "tradeable": True},
+    {"name": 'طبیب دانا', "category": 'انسان', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'خنیاگر دانا', "category": 'انسان', "rarity": 'Common', "price": 105, "xp": 7, "tradeable": True},
+    {"name": 'زائر دانا', "category": 'انسان', "rarity": 'Rare', "price": 295, "xp": 19, "tradeable": True},
+    {"name": 'سرباز دانا', "category": 'انسان', "rarity": 'Mythic', "price": 1935, "xp": 129, "tradeable": True},
+    {"name": 'کاشف دانا', "category": 'انسان', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز شجاع', "category": 'انسان', "rarity": 'Uncommon', "price": 113, "xp": 7, "tradeable": True},
+    {"name": 'شکارچی شجاع', "category": 'انسان', "rarity": 'Rare', "price": 170, "xp": 11, "tradeable": True},
+    {"name": 'جادوگر شجاع', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'شوالیه شجاع', "category": 'انسان', "rarity": 'Epic', "price": 686, "xp": 45, "tradeable": True},
+    {"name": 'دزد شجاع', "category": 'انسان', "rarity": 'Epic', "price": 430, "xp": 28, "tradeable": True},
+    {"name": 'کیمیاگر شجاع', "category": 'انسان', "rarity": 'Rare', "price": 312, "xp": 20, "tradeable": True},
+    {"name": 'ناخدا شجاع', "category": 'انسان', "rarity": 'Epic', "price": 507, "xp": 33, "tradeable": True},
+    {"name": 'کوهنورد شجاع', "category": 'انسان', "rarity": 'Uncommon', "price": 189, "xp": 12, "tradeable": True},
+    {"name": 'پیک شجاع', "category": 'انسان', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'نگهبان شجاع', "category": 'انسان', "rarity": 'Mythic', "price": 1548, "xp": 103, "tradeable": True},
+    {"name": 'راهزن شجاع', "category": 'انسان', "rarity": 'Uncommon', "price": 172, "xp": 11, "tradeable": True},
+    {"name": 'طبیب شجاع', "category": 'انسان', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'خنیاگر شجاع', "category": 'انسان', "rarity": 'Epic', "price": 400, "xp": 26, "tradeable": True},
+    {"name": 'زائر شجاع', "category": 'انسان', "rarity": 'Rare', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'سرباز شجاع', "category": 'انسان', "rarity": 'Epic', "price": 432, "xp": 28, "tradeable": True},
+    {"name": 'کاشف شجاع', "category": 'انسان', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز مرموز', "category": 'انسان', "rarity": 'Rare', "price": 208, "xp": 13, "tradeable": True},
+    {"name": 'شکارچی مرموز', "category": 'انسان', "rarity": 'Common', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'جادوگر مرموز', "category": 'انسان', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'شوالیه مرموز', "category": 'انسان', "rarity": 'Common', "price": 88, "xp": 5, "tradeable": True},
+    {"name": 'دزد مرموز', "category": 'انسان', "rarity": 'Legendary', "price": 1023, "xp": 68, "tradeable": True},
+    {"name": 'کیمیاگر مرموز', "category": 'انسان', "rarity": 'Epic', "price": 513, "xp": 34, "tradeable": True},
+    {"name": 'ناخدا مرموز', "category": 'انسان', "rarity": 'Uncommon', "price": 146, "xp": 9, "tradeable": True},
+    {"name": 'کوهنورد مرموز', "category": 'انسان', "rarity": 'Uncommon', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'پیک مرموز', "category": 'انسان', "rarity": 'Rare', "price": 230, "xp": 15, "tradeable": True},
+    {"name": 'نگهبان مرموز', "category": 'انسان', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'راهزن مرموز', "category": 'انسان', "rarity": 'Legendary', "price": 1022, "xp": 68, "tradeable": True},
+    {"name": 'طبیب مرموز', "category": 'انسان', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'خنیاگر مرموز', "category": 'انسان', "rarity": 'Common', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'زائر مرموز', "category": 'انسان', "rarity": 'Rare', "price": 354, "xp": 23, "tradeable": True},
+    {"name": 'سرباز مرموز', "category": 'انسان', "rarity": 'Uncommon', "price": 125, "xp": 8, "tradeable": True},
+    {"name": 'کاشف مرموز', "category": 'انسان', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'کشاورز خردمند', "category": 'انسان', "rarity": 'Rare', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'شکارچی خردمند', "category": 'انسان', "rarity": 'Epic', "price": 409, "xp": 27, "tradeable": True},
+    {"name": 'جادوگر خردمند', "category": 'انسان', "rarity": 'Common', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'شوالیه خردمند', "category": 'انسان', "rarity": 'Uncommon', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'دزد خردمند', "category": 'انسان', "rarity": 'Epic', "price": 1004, "xp": 66, "tradeable": True},
+    {"name": 'کیمیاگر خردمند', "category": 'انسان', "rarity": 'Uncommon', "price": 190, "xp": 12, "tradeable": True},
+    {"name": 'ناخدا خردمند', "category": 'انسان', "rarity": 'Rare', "price": 381, "xp": 25, "tradeable": True},
+    {"name": 'کوهنورد خردمند', "category": 'انسان', "rarity": 'Legendary', "price": 1629, "xp": 108, "tradeable": True},
+    {"name": 'پیک خردمند', "category": 'انسان', "rarity": 'Rare', "price": 369, "xp": 24, "tradeable": True},
+    {"name": 'نگهبان خردمند', "category": 'انسان', "rarity": 'Rare', "price": 307, "xp": 20, "tradeable": True},
+    {"name": 'راهزن خردمند', "category": 'انسان', "rarity": 'Uncommon', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'طبیب خردمند', "category": 'انسان', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'خنیاگر خردمند', "category": 'انسان', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'زائر خردمند', "category": 'انسان', "rarity": 'Common', "price": 90, "xp": 6, "tradeable": True},
+    {"name": 'سرباز خردمند', "category": 'انسان', "rarity": 'Rare', "price": 153, "xp": 10, "tradeable": True},
+    {"name": 'کاشف خردمند', "category": 'انسان', "rarity": 'Common', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز زخمی', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'شکارچی زخمی', "category": 'انسان', "rarity": 'Rare', "price": 157, "xp": 10, "tradeable": True},
+    {"name": 'جادوگر زخمی', "category": 'انسان', "rarity": 'Rare', "price": 324, "xp": 21, "tradeable": True},
+    {"name": 'شوالیه زخمی', "category": 'انسان', "rarity": 'Legendary', "price": 1200, "xp": 80, "tradeable": True},
+    {"name": 'دزد زخمی', "category": 'انسان', "rarity": 'Epic', "price": 709, "xp": 47, "tradeable": True},
+    {"name": 'کیمیاگر زخمی', "category": 'انسان', "rarity": 'Rare', "price": 242, "xp": 16, "tradeable": True},
+    {"name": 'ناخدا زخمی', "category": 'انسان', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'کوهنورد زخمی', "category": 'انسان', "rarity": 'Common', "price": 94, "xp": 6, "tradeable": True},
+    {"name": 'پیک زخمی', "category": 'انسان', "rarity": 'Epic', "price": 474, "xp": 31, "tradeable": True},
+    {"name": 'نگهبان زخمی', "category": 'انسان', "rarity": 'Uncommon', "price": 175, "xp": 11, "tradeable": True},
+    {"name": 'راهزن زخمی', "category": 'انسان', "rarity": 'Rare', "price": 179, "xp": 11, "tradeable": True},
+    {"name": 'طبیب زخمی', "category": 'انسان', "rarity": 'Common', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'خنیاگر زخمی', "category": 'انسان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'زائر زخمی', "category": 'انسان', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'سرباز زخمی', "category": 'انسان', "rarity": 'Legendary', "price": 1153, "xp": 76, "tradeable": True},
+    {"name": 'کاشف زخمی', "category": 'انسان', "rarity": 'Common', "price": 37, "xp": 2, "tradeable": True},
+    {"name": 'کشاورز بی\u200cباک', "category": 'انسان', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'شکارچی بی\u200cباک', "category": 'انسان', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'جادوگر بی\u200cباک', "category": 'انسان', "rarity": 'Legendary', "price": 1006, "xp": 67, "tradeable": True},
+    {"name": 'شوالیه بی\u200cباک', "category": 'انسان', "rarity": 'Uncommon', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'دزد بی\u200cباک', "category": 'انسان', "rarity": 'Rare', "price": 235, "xp": 15, "tradeable": True},
+    {"name": 'کیمیاگر بی\u200cباک', "category": 'انسان', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'ناخدا بی\u200cباک', "category": 'انسان', "rarity": 'Uncommon', "price": 104, "xp": 6, "tradeable": True},
+    {"name": 'کوهنورد بی\u200cباک', "category": 'انسان', "rarity": 'Common', "price": 58, "xp": 3, "tradeable": True},
+    {"name": 'پیک بی\u200cباک', "category": 'انسان', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'نگهبان بی\u200cباک', "category": 'انسان', "rarity": 'Legendary', "price": 1168, "xp": 77, "tradeable": True},
+    {"name": 'راهزن بی\u200cباک', "category": 'انسان', "rarity": 'Rare', "price": 170, "xp": 11, "tradeable": True},
+    {"name": 'طبیب بی\u200cباک', "category": 'انسان', "rarity": 'Epic', "price": 415, "xp": 27, "tradeable": True},
+    {"name": 'خنیاگر بی\u200cباک', "category": 'انسان', "rarity": 'Rare', "price": 215, "xp": 14, "tradeable": True},
+    {"name": 'زائر بی\u200cباک', "category": 'انسان', "rarity": 'Uncommon', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'سرباز بی\u200cباک', "category": 'انسان', "rarity": 'Uncommon', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'کاشف بی\u200cباک', "category": 'انسان', "rarity": 'Uncommon', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز خاموش', "category": 'انسان', "rarity": 'Epic', "price": 349, "xp": 23, "tradeable": True},
+    {"name": 'شکارچی خاموش', "category": 'انسان', "rarity": 'Common', "price": 101, "xp": 6, "tradeable": True},
+    {"name": 'جادوگر خاموش', "category": 'انسان', "rarity": 'Uncommon', "price": 246, "xp": 16, "tradeable": True},
+    {"name": 'شوالیه خاموش', "category": 'انسان', "rarity": 'Common', "price": 116, "xp": 7, "tradeable": True},
+    {"name": 'دزد خاموش', "category": 'انسان', "rarity": 'Uncommon', "price": 123, "xp": 8, "tradeable": True},
+    {"name": 'کیمیاگر خاموش', "category": 'انسان', "rarity": 'Common', "price": 38, "xp": 2, "tradeable": True},
+    {"name": 'ناخدا خاموش', "category": 'انسان', "rarity": 'Uncommon', "price": 193, "xp": 12, "tradeable": True},
+    {"name": 'کوهنورد خاموش', "category": 'انسان', "rarity": 'Rare', "price": 237, "xp": 15, "tradeable": True},
+    {"name": 'پیک خاموش', "category": 'انسان', "rarity": 'Epic', "price": 442, "xp": 29, "tradeable": True},
+    {"name": 'نگهبان خاموش', "category": 'انسان', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'راهزن خاموش', "category": 'انسان', "rarity": 'Epic', "price": 560, "xp": 37, "tradeable": True},
+    {"name": 'طبیب خاموش', "category": 'انسان', "rarity": 'Uncommon', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'خنیاگر خاموش', "category": 'انسان', "rarity": 'Rare', "price": 396, "xp": 26, "tradeable": True},
+    {"name": 'زائر خاموش', "category": 'انسان', "rarity": 'Common', "price": 101, "xp": 6, "tradeable": True},
+    {"name": 'سرباز خاموش', "category": 'انسان', "rarity": 'Uncommon', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'کاشف خاموش', "category": 'انسان', "rarity": 'Common', "price": 58, "xp": 3, "tradeable": True},
+    {"name": 'کشاورز سرکش', "category": 'انسان', "rarity": 'Uncommon', "price": 193, "xp": 12, "tradeable": True},
+    {"name": 'شکارچی سرکش', "category": 'انسان', "rarity": 'Common', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'جادوگر سرکش', "category": 'انسان', "rarity": 'Rare', "price": 244, "xp": 16, "tradeable": True},
+    {"name": 'شوالیه سرکش', "category": 'انسان', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'دزد سرکش', "category": 'انسان', "rarity": 'Rare', "price": 189, "xp": 12, "tradeable": True},
+    {"name": 'کیمیاگر سرکش', "category": 'انسان', "rarity": 'Rare', "price": 302, "xp": 20, "tradeable": True},
+    {"name": 'ناخدا سرکش', "category": 'انسان', "rarity": 'Mythic', "price": 3196, "xp": 213, "tradeable": True},
+    {"name": 'کوهنورد سرکش', "category": 'انسان', "rarity": 'Mythic', "price": 1535, "xp": 102, "tradeable": True},
+    {"name": 'پیک سرکش', "category": 'انسان', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'نگهبان سرکش', "category": 'انسان', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'راهزن سرکش', "category": 'انسان', "rarity": 'Common', "price": 76, "xp": 5, "tradeable": True},
+    {"name": 'طبیب سرکش', "category": 'انسان', "rarity": 'Common', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'خنیاگر سرکش', "category": 'انسان', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'زائر سرکش', "category": 'انسان', "rarity": 'Uncommon', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'سرباز سرکش', "category": 'انسان', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'کاشف سرکش', "category": 'انسان', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'کشاورز فراری', "category": 'انسان', "rarity": 'Uncommon', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'شکارچی فراری', "category": 'انسان', "rarity": 'Epic', "price": 458, "xp": 30, "tradeable": True},
+    {"name": 'جادوگر فراری', "category": 'انسان', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'شوالیه فراری', "category": 'انسان', "rarity": 'Rare', "price": 275, "xp": 18, "tradeable": True},
+    {"name": 'دزد فراری', "category": 'انسان', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'کیمیاگر فراری', "category": 'انسان', "rarity": 'Uncommon', "price": 160, "xp": 10, "tradeable": True},
+    {"name": 'ناخدا فراری', "category": 'انسان', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'کوهنورد فراری', "category": 'انسان', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'پیک فراری', "category": 'انسان', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'نگهبان فراری', "category": 'انسان', "rarity": 'Common', "price": 30, "xp": 2, "tradeable": True},
+    {"name": 'راهزن فراری', "category": 'انسان', "rarity": 'Rare', "price": 340, "xp": 22, "tradeable": True},
+    {"name": 'طبیب فراری', "category": 'انسان', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'خنیاگر فراری', "category": 'انسان', "rarity": 'Uncommon', "price": 148, "xp": 9, "tradeable": True},
+    {"name": 'زائر فراری', "category": 'انسان', "rarity": 'Rare', "price": 222, "xp": 14, "tradeable": True},
+    {"name": 'سرباز فراری', "category": 'انسان', "rarity": 'Uncommon', "price": 122, "xp": 8, "tradeable": True},
+    {"name": 'کاشف فراری', "category": 'انسان', "rarity": 'Epic', "price": 258, "xp": 17, "tradeable": True},
+    {"name": 'کشاورز وفادار', "category": 'انسان', "rarity": 'Rare', "price": 269, "xp": 17, "tradeable": True},
+    {"name": 'شکارچی وفادار', "category": 'انسان', "rarity": 'Uncommon', "price": 156, "xp": 10, "tradeable": True},
+    {"name": 'جادوگر وفادار', "category": 'انسان', "rarity": 'Legendary', "price": 1508, "xp": 100, "tradeable": True},
+    {"name": 'شوالیه وفادار', "category": 'انسان', "rarity": 'Uncommon', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'دزد وفادار', "category": 'انسان', "rarity": 'Rare', "price": 201, "xp": 13, "tradeable": True},
+    {"name": 'کیمیاگر وفادار', "category": 'انسان', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'ناخدا وفادار', "category": 'انسان', "rarity": 'Rare', "price": 278, "xp": 18, "tradeable": True},
+    {"name": 'کوهنورد وفادار', "category": 'انسان', "rarity": 'Rare', "price": 215, "xp": 14, "tradeable": True},
+    {"name": 'پیک وفادار', "category": 'انسان', "rarity": 'Rare', "price": 231, "xp": 15, "tradeable": True},
+    {"name": 'نگهبان وفادار', "category": 'انسان', "rarity": 'Uncommon', "price": 236, "xp": 15, "tradeable": True},
+    {"name": 'راهزن وفادار', "category": 'انسان', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'طبیب وفادار', "category": 'انسان', "rarity": 'Rare', "price": 192, "xp": 12, "tradeable": True},
+    {"name": 'خنیاگر وفادار', "category": 'انسان', "rarity": 'Rare', "price": 298, "xp": 19, "tradeable": True},
+    {"name": 'زائر وفادار', "category": 'انسان', "rarity": 'Uncommon', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'سرباز وفادار', "category": 'انسان', "rarity": 'Common', "price": 59, "xp": 3, "tradeable": True},
+    {"name": 'کاشف وفادار', "category": 'انسان', "rarity": 'Mythic', "price": 2994, "xp": 199, "tradeable": True},
+    {"name": 'کشاورز تنها', "category": 'انسان', "rarity": 'Epic', "price": 270, "xp": 18, "tradeable": True},
+    {"name": 'شکارچی تنها', "category": 'انسان', "rarity": 'Uncommon', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'جادوگر تنها', "category": 'انسان', "rarity": 'Uncommon', "price": 206, "xp": 13, "tradeable": True},
+    {"name": 'شوالیه تنها', "category": 'انسان', "rarity": 'Rare', "price": 209, "xp": 13, "tradeable": True},
+    {"name": 'دزد تنها', "category": 'انسان', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'کیمیاگر تنها', "category": 'انسان', "rarity": 'Rare', "price": 146, "xp": 9, "tradeable": True},
+    {"name": 'ناخدا تنها', "category": 'انسان', "rarity": 'Uncommon', "price": 138, "xp": 9, "tradeable": True},
+    {"name": 'کوهنورد تنها', "category": 'انسان', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'پیک تنها', "category": 'انسان', "rarity": 'Common', "price": 45, "xp": 3, "tradeable": True},
+    {"name": 'نگهبان تنها', "category": 'انسان', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'راهزن تنها', "category": 'انسان', "rarity": 'Rare', "price": 438, "xp": 29, "tradeable": True},
+    {"name": 'طبیب تنها', "category": 'انسان', "rarity": 'Uncommon', "price": 234, "xp": 15, "tradeable": True},
+    {"name": 'خنیاگر تنها', "category": 'انسان', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'زائر تنها', "category": 'انسان', "rarity": 'Common', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'سرباز تنها', "category": 'انسان', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'کاشف تنها', "category": 'انسان', "rarity": 'Rare', "price": 322, "xp": 21, "tradeable": True},
+    {"name": 'کشاورز پرشور', "category": 'انسان', "rarity": 'Rare', "price": 309, "xp": 20, "tradeable": True},
+    {"name": 'شکارچی پرشور', "category": 'انسان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'جادوگر پرشور', "category": 'انسان', "rarity": 'Uncommon', "price": 226, "xp": 15, "tradeable": True},
+    {"name": 'شوالیه پرشور', "category": 'انسان', "rarity": 'Uncommon', "price": 177, "xp": 11, "tradeable": True},
+    {"name": 'دزد پرشور', "category": 'انسان', "rarity": 'Uncommon', "price": 195, "xp": 13, "tradeable": True},
+    {"name": 'کیمیاگر پرشور', "category": 'انسان', "rarity": 'Legendary', "price": 1045, "xp": 69, "tradeable": True},
+    {"name": 'ناخدا پرشور', "category": 'انسان', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'کوهنورد پرشور', "category": 'انسان', "rarity": 'Rare', "price": 134, "xp": 8, "tradeable": True},
+    {"name": 'پیک پرشور', "category": 'انسان', "rarity": 'Uncommon', "price": 154, "xp": 10, "tradeable": True},
+    {"name": 'نگهبان پرشور', "category": 'انسان', "rarity": 'Rare', "price": 205, "xp": 13, "tradeable": True},
+    {"name": 'راهزن پرشور', "category": 'انسان', "rarity": 'Common', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'طبیب پرشور', "category": 'انسان', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'خنیاگر پرشور', "category": 'انسان', "rarity": 'Uncommon', "price": 243, "xp": 16, "tradeable": True},
+    {"name": 'زائر پرشور', "category": 'انسان', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'سرباز پرشور', "category": 'انسان', "rarity": 'Rare', "price": 164, "xp": 10, "tradeable": True},
+    {"name": 'کاشف پرشور', "category": 'انسان', "rarity": 'Rare', "price": 244, "xp": 16, "tradeable": True},
+    {"name": 'کشاورز کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 196, "xp": 13, "tradeable": True},
+    {"name": 'شکارچی کهنه\u200cکار', "category": 'انسان', "rarity": 'Epic', "price": 776, "xp": 51, "tradeable": True},
+    {"name": 'جادوگر کهنه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 113, "xp": 7, "tradeable": True},
+    {"name": 'شوالیه کهنه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 34, "xp": 2, "tradeable": True},
+    {"name": 'دزد کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 342, "xp": 22, "tradeable": True},
+    {"name": 'کیمیاگر کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 438, "xp": 29, "tradeable": True},
+    {"name": 'ناخدا کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 171, "xp": 11, "tradeable": True},
+    {"name": 'کوهنورد کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'پیک کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 262, "xp": 17, "tradeable": True},
+    {"name": 'نگهبان کهنه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 130, "xp": 8, "tradeable": True},
+    {"name": 'راهزن کهنه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 93, "xp": 6, "tradeable": True},
+    {"name": 'طبیب کهنه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'خنیاگر کهنه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'زائر کهنه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'سرباز کهنه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'کاشف کهنه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 167, "xp": 11, "tradeable": True},
+    {"name": 'کشاورز تازه\u200cکار', "category": 'انسان', "rarity": 'Legendary', "price": 1141, "xp": 76, "tradeable": True},
+    {"name": 'شکارچی تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'جادوگر تازه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'شوالیه تازه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 84, "xp": 5, "tradeable": True},
+    {"name": 'دزد تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'کیمیاگر تازه\u200cکار', "category": 'انسان', "rarity": 'Epic', "price": 599, "xp": 39, "tradeable": True},
+    {"name": 'ناخدا تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 90, "xp": 6, "tradeable": True},
+    {"name": 'کوهنورد تازه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 313, "xp": 20, "tradeable": True},
+    {"name": 'پیک تازه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'نگهبان تازه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'راهزن تازه\u200cکار', "category": 'انسان', "rarity": 'Rare', "price": 209, "xp": 13, "tradeable": True},
+    {"name": 'طبیب تازه\u200cکار', "category": 'انسان', "rarity": 'Legendary', "price": 501, "xp": 33, "tradeable": True},
+    {"name": 'خنیاگر تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 177, "xp": 11, "tradeable": True},
+    {"name": 'زائر تازه\u200cکار', "category": 'انسان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'سرباز تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'کاشف تازه\u200cکار', "category": 'انسان', "rarity": 'Uncommon', "price": 161, "xp": 10, "tradeable": True},
+    {"name": 'روباه برفی', "category": 'حیوان', "rarity": 'Legendary', "price": 710, "xp": 47, "tradeable": True},
+    {"name": 'شیر برفی', "category": 'حیوان', "rarity": 'Epic', "price": 934, "xp": 62, "tradeable": True},
+    {"name": 'عقاب برفی', "category": 'حیوان', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'گرگ برفی', "category": 'حیوان', "rarity": 'Uncommon', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'ببر برفی', "category": 'حیوان', "rarity": 'Mythic', "price": 3080, "xp": 205, "tradeable": True},
+    {"name": 'پلنگ برفی', "category": 'حیوان', "rarity": 'Epic', "price": 513, "xp": 34, "tradeable": True},
+    {"name": 'خرس برفی', "category": 'حیوان', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'گوزن برفی', "category": 'حیوان', "rarity": 'Uncommon', "price": 137, "xp": 9, "tradeable": True},
+    {"name": 'مار برفی', "category": 'حیوان', "rarity": 'Epic', "price": 526, "xp": 35, "tradeable": True},
+    {"name": 'کرکس برفی', "category": 'حیوان', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'سنجاب برفی', "category": 'حیوان', "rarity": 'Legendary', "price": 1339, "xp": 89, "tradeable": True},
+    {"name": 'جغد برفی', "category": 'حیوان', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'شاهین برفی', "category": 'حیوان', "rarity": 'Uncommon', "price": 152, "xp": 10, "tradeable": True},
+    {"name": 'آهو برفی', "category": 'حیوان', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'خرگوش برفی', "category": 'حیوان', "rarity": 'Common', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'روباه طلایی', "category": 'حیوان', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'شیر طلایی', "category": 'حیوان', "rarity": 'Uncommon', "price": 199, "xp": 13, "tradeable": True},
+    {"name": 'عقاب طلایی', "category": 'حیوان', "rarity": 'Rare', "price": 243, "xp": 16, "tradeable": True},
+    {"name": 'گرگ طلایی', "category": 'حیوان', "rarity": 'Rare', "price": 407, "xp": 27, "tradeable": True},
+    {"name": 'ببر طلایی', "category": 'حیوان', "rarity": 'Legendary', "price": 795, "xp": 53, "tradeable": True},
+    {"name": 'پلنگ طلایی', "category": 'حیوان', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'خرس طلایی', "category": 'حیوان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'گوزن طلایی', "category": 'حیوان', "rarity": 'Rare', "price": 495, "xp": 33, "tradeable": True},
+    {"name": 'مار طلایی', "category": 'حیوان', "rarity": 'Uncommon', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'کرکس طلایی', "category": 'حیوان', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'سنجاب طلایی', "category": 'حیوان', "rarity": 'Epic', "price": 371, "xp": 24, "tradeable": True},
+    {"name": 'جغد طلایی', "category": 'حیوان', "rarity": 'Uncommon', "price": 52, "xp": 3, "tradeable": True},
+    {"name": 'شاهین طلایی', "category": 'حیوان', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'آهو طلایی', "category": 'حیوان', "rarity": 'Common', "price": 90, "xp": 6, "tradeable": True},
+    {"name": 'خرگوش طلایی', "category": 'حیوان', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'روباه سیاه', "category": 'حیوان', "rarity": 'Common', "price": 28, "xp": 1, "tradeable": True},
+    {"name": 'شیر سیاه', "category": 'حیوان', "rarity": 'Mythic', "price": 1476, "xp": 98, "tradeable": True},
+    {"name": 'عقاب سیاه', "category": 'حیوان', "rarity": 'Rare', "price": 198, "xp": 13, "tradeable": True},
+    {"name": 'گرگ سیاه', "category": 'حیوان', "rarity": 'Common', "price": 30, "xp": 2, "tradeable": True},
+    {"name": 'ببر سیاه', "category": 'حیوان', "rarity": 'Rare', "price": 229, "xp": 15, "tradeable": True},
+    {"name": 'پلنگ سیاه', "category": 'حیوان', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'خرس سیاه', "category": 'حیوان', "rarity": 'Uncommon', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'گوزن سیاه', "category": 'حیوان', "rarity": 'Rare', "price": 416, "xp": 27, "tradeable": True},
+    {"name": 'مار سیاه', "category": 'حیوان', "rarity": 'Uncommon', "price": 147, "xp": 9, "tradeable": True},
+    {"name": 'کرکس سیاه', "category": 'حیوان', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'سنجاب سیاه', "category": 'حیوان', "rarity": 'Uncommon', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'جغد سیاه', "category": 'حیوان', "rarity": 'Uncommon', "price": 164, "xp": 10, "tradeable": True},
+    {"name": 'شاهین سیاه', "category": 'حیوان', "rarity": 'Common', "price": 71, "xp": 4, "tradeable": True},
+    {"name": 'آهو سیاه', "category": 'حیوان', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'خرگوش سیاه', "category": 'حیوان', "rarity": 'Common', "price": 115, "xp": 7, "tradeable": True},
+    {"name": 'روباه سفید', "category": 'حیوان', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'شیر سفید', "category": 'حیوان', "rarity": 'Uncommon', "price": 144, "xp": 9, "tradeable": True},
+    {"name": 'عقاب سفید', "category": 'حیوان', "rarity": 'Rare', "price": 464, "xp": 30, "tradeable": True},
+    {"name": 'گرگ سفید', "category": 'حیوان', "rarity": 'Common', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'ببر سفید', "category": 'حیوان', "rarity": 'Uncommon', "price": 175, "xp": 11, "tradeable": True},
+    {"name": 'پلنگ سفید', "category": 'حیوان', "rarity": 'Rare', "price": 283, "xp": 18, "tradeable": True},
+    {"name": 'خرس سفید', "category": 'حیوان', "rarity": 'Rare', "price": 393, "xp": 26, "tradeable": True},
+    {"name": 'گوزن سفید', "category": 'حیوان', "rarity": 'Rare', "price": 300, "xp": 20, "tradeable": True},
+    {"name": 'مار سفید', "category": 'حیوان', "rarity": 'Epic', "price": 333, "xp": 22, "tradeable": True},
+    {"name": 'کرکس سفید', "category": 'حیوان', "rarity": 'Rare', "price": 371, "xp": 24, "tradeable": True},
+    {"name": 'سنجاب سفید', "category": 'حیوان', "rarity": 'Uncommon', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'جغد سفید', "category": 'حیوان', "rarity": 'Uncommon', "price": 207, "xp": 13, "tradeable": True},
+    {"name": 'شاهین سفید', "category": 'حیوان', "rarity": 'Rare', "price": 290, "xp": 19, "tradeable": True},
+    {"name": 'آهو سفید', "category": 'حیوان', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'خرگوش سفید', "category": 'حیوان', "rarity": 'Rare', "price": 283, "xp": 18, "tradeable": True},
+    {"name": 'روباه زخمی', "category": 'حیوان', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'شیر زخمی', "category": 'حیوان', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'عقاب زخمی', "category": 'حیوان', "rarity": 'Epic', "price": 291, "xp": 19, "tradeable": True},
+    {"name": 'گرگ زخمی', "category": 'حیوان', "rarity": 'Rare', "price": 208, "xp": 13, "tradeable": True},
+    {"name": 'ببر زخمی', "category": 'حیوان', "rarity": 'Common', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'پلنگ زخمی', "category": 'حیوان', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'خرس زخمی', "category": 'حیوان', "rarity": 'Uncommon', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'گوزن زخمی', "category": 'حیوان', "rarity": 'Rare', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'مار زخمی', "category": 'حیوان', "rarity": 'Uncommon', "price": 157, "xp": 10, "tradeable": True},
+    {"name": 'کرکس زخمی', "category": 'حیوان', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'سنجاب زخمی', "category": 'حیوان', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'جغد زخمی', "category": 'حیوان', "rarity": 'Common', "price": 40, "xp": 2, "tradeable": True},
+    {"name": 'شاهین زخمی', "category": 'حیوان', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'آهو زخمی', "category": 'حیوان', "rarity": 'Uncommon', "price": 116, "xp": 7, "tradeable": True},
+    {"name": 'خرگوش زخمی', "category": 'حیوان', "rarity": 'Uncommon', "price": 150, "xp": 10, "tradeable": True},
+    {"name": 'روباه وحشی', "category": 'حیوان', "rarity": 'Common', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'شیر وحشی', "category": 'حیوان', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'عقاب وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'گرگ وحشی', "category": 'حیوان', "rarity": 'Legendary', "price": 833, "xp": 55, "tradeable": True},
+    {"name": 'ببر وحشی', "category": 'حیوان', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'پلنگ وحشی', "category": 'حیوان', "rarity": 'Rare', "price": 179, "xp": 11, "tradeable": True},
+    {"name": 'خرس وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 123, "xp": 8, "tradeable": True},
+    {"name": 'گوزن وحشی', "category": 'حیوان', "rarity": 'Epic', "price": 501, "xp": 33, "tradeable": True},
+    {"name": 'مار وحشی', "category": 'حیوان', "rarity": 'Epic', "price": 285, "xp": 19, "tradeable": True},
+    {"name": 'کرکس وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'سنجاب وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 187, "xp": 12, "tradeable": True},
+    {"name": 'جغد وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 88, "xp": 5, "tradeable": True},
+    {"name": 'شاهین وحشی', "category": 'حیوان', "rarity": 'Mythic', "price": 1837, "xp": 122, "tradeable": True},
+    {"name": 'آهو وحشی', "category": 'حیوان', "rarity": 'Uncommon', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'خرگوش وحشی', "category": 'حیوان', "rarity": 'Epic', "price": 496, "xp": 33, "tradeable": True},
+    {"name": 'روباه رام', "category": 'حیوان', "rarity": 'Uncommon', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'شیر رام', "category": 'حیوان', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'عقاب رام', "category": 'حیوان', "rarity": 'Rare', "price": 164, "xp": 10, "tradeable": True},
+    {"name": 'گرگ رام', "category": 'حیوان', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'ببر رام', "category": 'حیوان', "rarity": 'Rare', "price": 344, "xp": 22, "tradeable": True},
+    {"name": 'پلنگ رام', "category": 'حیوان', "rarity": 'Epic', "price": 352, "xp": 23, "tradeable": True},
+    {"name": 'خرس رام', "category": 'حیوان', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'گوزن رام', "category": 'حیوان', "rarity": 'Common', "price": 34, "xp": 2, "tradeable": True},
+    {"name": 'مار رام', "category": 'حیوان', "rarity": 'Rare', "price": 383, "xp": 25, "tradeable": True},
+    {"name": 'کرکس رام', "category": 'حیوان', "rarity": 'Uncommon', "price": 198, "xp": 13, "tradeable": True},
+    {"name": 'سنجاب رام', "category": 'حیوان', "rarity": 'Epic', "price": 699, "xp": 46, "tradeable": True},
+    {"name": 'جغد رام', "category": 'حیوان', "rarity": 'Uncommon', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'شاهین رام', "category": 'حیوان', "rarity": 'Uncommon', "price": 162, "xp": 10, "tradeable": True},
+    {"name": 'آهو رام', "category": 'حیوان', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'خرگوش رام', "category": 'حیوان', "rarity": 'Common', "price": 71, "xp": 4, "tradeable": True},
+    {"name": 'روباه افسانه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'شیر افسانه\u200cای', "category": 'حیوان', "rarity": 'Epic', "price": 363, "xp": 24, "tradeable": True},
+    {"name": 'عقاب افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 194, "xp": 12, "tradeable": True},
+    {"name": 'گرگ افسانه\u200cای', "category": 'حیوان', "rarity": 'Legendary', "price": 538, "xp": 35, "tradeable": True},
+    {"name": 'ببر افسانه\u200cای', "category": 'حیوان', "rarity": 'Epic', "price": 415, "xp": 27, "tradeable": True},
+    {"name": 'پلنگ افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 125, "xp": 8, "tradeable": True},
+    {"name": 'خرس افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 188, "xp": 12, "tradeable": True},
+    {"name": 'گوزن افسانه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'مار افسانه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 365, "xp": 24, "tradeable": True},
+    {"name": 'کرکس افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'سنجاب افسانه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'جغد افسانه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 172, "xp": 11, "tradeable": True},
+    {"name": 'شاهین افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'آهو افسانه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 148, "xp": 9, "tradeable": True},
+    {"name": 'خرگوش افسانه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 189, "xp": 12, "tradeable": True},
+    {"name": 'روباه غول\u200cپیکر', "category": 'حیوان', "rarity": 'Uncommon', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'شیر غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'عقاب غول\u200cپیکر', "category": 'حیوان', "rarity": 'Rare', "price": 152, "xp": 10, "tradeable": True},
+    {"name": 'گرگ غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'ببر غول\u200cپیکر', "category": 'حیوان', "rarity": 'Rare', "price": 328, "xp": 21, "tradeable": True},
+    {"name": 'پلنگ غول\u200cپیکر', "category": 'حیوان', "rarity": 'Rare', "price": 372, "xp": 24, "tradeable": True},
+    {"name": 'خرس غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'گوزن غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'مار غول\u200cپیکر', "category": 'حیوان', "rarity": 'Secret', "price": 4930, "xp": 328, "tradeable": True},
+    {"name": 'کرکس غول\u200cپیکر', "category": 'حیوان', "rarity": 'Epic', "price": 354, "xp": 23, "tradeable": True},
+    {"name": 'سنجاب غول\u200cپیکر', "category": 'حیوان', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'جغد غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'شاهین غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'آهو غول\u200cپیکر', "category": 'حیوان', "rarity": 'Rare', "price": 236, "xp": 15, "tradeable": True},
+    {"name": 'خرگوش غول\u200cپیکر', "category": 'حیوان', "rarity": 'Common', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'روباه کوچک', "category": 'حیوان', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'شیر کوچک', "category": 'حیوان', "rarity": 'Rare', "price": 319, "xp": 21, "tradeable": True},
+    {"name": 'عقاب کوچک', "category": 'حیوان', "rarity": 'Common', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'گرگ کوچک', "category": 'حیوان', "rarity": 'Common', "price": 88, "xp": 5, "tradeable": True},
+    {"name": 'ببر کوچک', "category": 'حیوان', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'پلنگ کوچک', "category": 'حیوان', "rarity": 'Uncommon', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'خرس کوچک', "category": 'حیوان', "rarity": 'Epic', "price": 464, "xp": 30, "tradeable": True},
+    {"name": 'گوزن کوچک', "category": 'حیوان', "rarity": 'Common', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'مار کوچک', "category": 'حیوان', "rarity": 'Uncommon', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'کرکس کوچک', "category": 'حیوان', "rarity": 'Uncommon', "price": 84, "xp": 5, "tradeable": True},
+    {"name": 'سنجاب کوچک', "category": 'حیوان', "rarity": 'Rare', "price": 262, "xp": 17, "tradeable": True},
+    {"name": 'جغد کوچک', "category": 'حیوان', "rarity": 'Uncommon', "price": 143, "xp": 9, "tradeable": True},
+    {"name": 'شاهین کوچک', "category": 'حیوان', "rarity": 'Legendary', "price": 1621, "xp": 108, "tradeable": True},
+    {"name": 'آهو کوچک', "category": 'حیوان', "rarity": 'Legendary', "price": 1029, "xp": 68, "tradeable": True},
+    {"name": 'خرگوش کوچک', "category": 'حیوان', "rarity": 'Uncommon', "price": 119, "xp": 7, "tradeable": True},
+    {"name": 'روباه چابک', "category": 'حیوان', "rarity": 'Common', "price": 47, "xp": 3, "tradeable": True},
+    {"name": 'شیر چابک', "category": 'حیوان', "rarity": 'Legendary', "price": 1291, "xp": 86, "tradeable": True},
+    {"name": 'عقاب چابک', "category": 'حیوان', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'گرگ چابک', "category": 'حیوان', "rarity": 'Uncommon', "price": 110, "xp": 7, "tradeable": True},
+    {"name": 'ببر چابک', "category": 'حیوان', "rarity": 'Uncommon', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'پلنگ چابک', "category": 'حیوان', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'خرس چابک', "category": 'حیوان', "rarity": 'Uncommon', "price": 196, "xp": 13, "tradeable": True},
+    {"name": 'گوزن چابک', "category": 'حیوان', "rarity": 'Rare', "price": 228, "xp": 15, "tradeable": True},
+    {"name": 'مار چابک', "category": 'حیوان', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'کرکس چابک', "category": 'حیوان', "rarity": 'Uncommon', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'سنجاب چابک', "category": 'حیوان', "rarity": 'Legendary', "price": 1188, "xp": 79, "tradeable": True},
+    {"name": 'جغد چابک', "category": 'حیوان', "rarity": 'Uncommon', "price": 139, "xp": 9, "tradeable": True},
+    {"name": 'شاهین چابک', "category": 'حیوان', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'آهو چابک', "category": 'حیوان', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'خرگوش چابک', "category": 'حیوان', "rarity": 'Rare', "price": 499, "xp": 33, "tradeable": True},
+    {"name": 'روباه خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'شیر خاکستری', "category": 'حیوان', "rarity": 'Rare', "price": 404, "xp": 26, "tradeable": True},
+    {"name": 'عقاب خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'گرگ خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 71, "xp": 4, "tradeable": True},
+    {"name": 'ببر خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'پلنگ خاکستری', "category": 'حیوان', "rarity": 'Rare', "price": 203, "xp": 13, "tradeable": True},
+    {"name": 'خرس خاکستری', "category": 'حیوان', "rarity": 'Rare', "price": 249, "xp": 16, "tradeable": True},
+    {"name": 'گوزن خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 88, "xp": 5, "tradeable": True},
+    {"name": 'مار خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 114, "xp": 7, "tradeable": True},
+    {"name": 'کرکس خاکستری', "category": 'حیوان', "rarity": 'Uncommon', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'سنجاب خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'جغد خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'شاهین خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'آهو خاکستری', "category": 'حیوان', "rarity": 'Mythic', "price": 3078, "xp": 205, "tradeable": True},
+    {"name": 'خرگوش خاکستری', "category": 'حیوان', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'روباه آتشین', "category": 'حیوان', "rarity": 'Epic', "price": 355, "xp": 23, "tradeable": True},
+    {"name": 'شیر آتشین', "category": 'حیوان', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'عقاب آتشین', "category": 'حیوان', "rarity": 'Uncommon', "price": 189, "xp": 12, "tradeable": True},
+    {"name": 'گرگ آتشین', "category": 'حیوان', "rarity": 'Epic', "price": 612, "xp": 40, "tradeable": True},
+    {"name": 'ببر آتشین', "category": 'حیوان', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'پلنگ آتشین', "category": 'حیوان', "rarity": 'Rare', "price": 307, "xp": 20, "tradeable": True},
+    {"name": 'خرس آتشین', "category": 'حیوان', "rarity": 'Rare', "price": 162, "xp": 10, "tradeable": True},
+    {"name": 'گوزن آتشین', "category": 'حیوان', "rarity": 'God', "price": 3411, "xp": 227, "tradeable": True},
+    {"name": 'مار آتشین', "category": 'حیوان', "rarity": 'Common', "price": 38, "xp": 2, "tradeable": True},
+    {"name": 'کرکس آتشین', "category": 'حیوان', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'سنجاب آتشین', "category": 'حیوان', "rarity": 'Uncommon', "price": 167, "xp": 11, "tradeable": True},
+    {"name": 'جغد آتشین', "category": 'حیوان', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'شاهین آتشین', "category": 'حیوان', "rarity": 'Uncommon', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'آهو آتشین', "category": 'حیوان', "rarity": 'Uncommon', "price": 160, "xp": 10, "tradeable": True},
+    {"name": 'خرگوش آتشین', "category": 'حیوان', "rarity": 'Rare', "price": 255, "xp": 17, "tradeable": True},
+    {"name": 'روباه یخی', "category": 'حیوان', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'شیر یخی', "category": 'حیوان', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'عقاب یخی', "category": 'حیوان', "rarity": 'Legendary', "price": 562, "xp": 37, "tradeable": True},
+    {"name": 'گرگ یخی', "category": 'حیوان', "rarity": 'Rare', "price": 303, "xp": 20, "tradeable": True},
+    {"name": 'ببر یخی', "category": 'حیوان', "rarity": 'Rare', "price": 200, "xp": 13, "tradeable": True},
+    {"name": 'پلنگ یخی', "category": 'حیوان', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'خرس یخی', "category": 'حیوان', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'گوزن یخی', "category": 'حیوان', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'مار یخی', "category": 'حیوان', "rarity": 'Common', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'کرکس یخی', "category": 'حیوان', "rarity": 'Uncommon', "price": 165, "xp": 11, "tradeable": True},
+    {"name": 'سنجاب یخی', "category": 'حیوان', "rarity": 'Common', "price": 40, "xp": 2, "tradeable": True},
+    {"name": 'جغد یخی', "category": 'حیوان', "rarity": 'Epic', "price": 893, "xp": 59, "tradeable": True},
+    {"name": 'شاهین یخی', "category": 'حیوان', "rarity": 'Epic', "price": 634, "xp": 42, "tradeable": True},
+    {"name": 'آهو یخی', "category": 'حیوان', "rarity": 'Rare', "price": 428, "xp": 28, "tradeable": True},
+    {"name": 'خرگوش یخی', "category": 'حیوان', "rarity": 'Epic', "price": 462, "xp": 30, "tradeable": True},
+    {"name": 'روباه سایه\u200cای', "category": 'حیوان', "rarity": 'Legendary', "price": 933, "xp": 62, "tradeable": True},
+    {"name": 'شیر سایه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 116, "xp": 7, "tradeable": True},
+    {"name": 'عقاب سایه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 286, "xp": 19, "tradeable": True},
+    {"name": 'گرگ سایه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'ببر سایه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 172, "xp": 11, "tradeable": True},
+    {"name": 'پلنگ سایه\u200cای', "category": 'حیوان', "rarity": 'Epic', "price": 290, "xp": 19, "tradeable": True},
+    {"name": 'خرس سایه\u200cای', "category": 'حیوان', "rarity": 'Secret', "price": 11606, "xp": 773, "tradeable": True},
+    {"name": 'گوزن سایه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 134, "xp": 8, "tradeable": True},
+    {"name": 'مار سایه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'کرکس سایه\u200cای', "category": 'حیوان', "rarity": 'Rare', "price": 255, "xp": 17, "tradeable": True},
+    {"name": 'سنجاب سایه\u200cای', "category": 'حیوان', "rarity": 'Epic', "price": 895, "xp": 59, "tradeable": True},
+    {"name": 'جغد سایه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 46, "xp": 3, "tradeable": True},
+    {"name": 'شاهین سایه\u200cای', "category": 'حیوان', "rarity": 'Legendary', "price": 674, "xp": 44, "tradeable": True},
+    {"name": 'آهو سایه\u200cای', "category": 'حیوان', "rarity": 'Uncommon', "price": 119, "xp": 7, "tradeable": True},
+    {"name": 'خرگوش سایه\u200cای', "category": 'حیوان', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'رز سرخ', "category": 'گل', "rarity": 'Legendary', "price": 1210, "xp": 80, "tradeable": True},
+    {"name": 'نیلوفر سرخ', "category": 'گل', "rarity": 'Common', "price": 93, "xp": 6, "tradeable": True},
+    {"name": 'لاله سرخ', "category": 'گل', "rarity": 'Uncommon', "price": 165, "xp": 11, "tradeable": True},
+    {"name": 'آفتابگردان سرخ', "category": 'گل', "rarity": 'Uncommon', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'مینا سرخ', "category": 'گل', "rarity": 'Uncommon', "price": 178, "xp": 11, "tradeable": True},
+    {"name": 'نرگس سرخ', "category": 'گل', "rarity": 'Uncommon', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'یاس سرخ', "category": 'گل', "rarity": 'Legendary', "price": 1063, "xp": 70, "tradeable": True},
+    {"name": 'ارکیده سرخ', "category": 'گل', "rarity": 'Rare', "price": 368, "xp": 24, "tradeable": True},
+    {"name": 'بنفشه سرخ', "category": 'گل', "rarity": 'Common', "price": 93, "xp": 6, "tradeable": True},
+    {"name": 'میخک سرخ', "category": 'گل', "rarity": 'Legendary', "price": 1259, "xp": 83, "tradeable": True},
+    {"name": 'رز سفید', "category": 'گل', "rarity": 'Epic', "price": 614, "xp": 40, "tradeable": True},
+    {"name": 'نیلوفر سفید', "category": 'گل', "rarity": 'Common', "price": 32, "xp": 2, "tradeable": True},
+    {"name": 'لاله سفید', "category": 'گل', "rarity": 'Uncommon', "price": 160, "xp": 10, "tradeable": True},
+    {"name": 'آفتابگردان سفید', "category": 'گل', "rarity": 'Uncommon', "price": 172, "xp": 11, "tradeable": True},
+    {"name": 'مینا سفید', "category": 'گل', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'نرگس سفید', "category": 'گل', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'یاس سفید', "category": 'گل', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'ارکیده سفید', "category": 'گل', "rarity": 'Common', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'بنفشه سفید', "category": 'گل', "rarity": 'Common', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'میخک سفید', "category": 'گل', "rarity": 'Uncommon', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'رز آبی', "category": 'گل', "rarity": 'Legendary', "price": 939, "xp": 62, "tradeable": True},
+    {"name": 'نیلوفر آبی', "category": 'گل', "rarity": 'Common', "price": 98, "xp": 6, "tradeable": True},
+    {"name": 'لاله آبی', "category": 'گل', "rarity": 'Epic', "price": 603, "xp": 40, "tradeable": True},
+    {"name": 'آفتابگردان آبی', "category": 'گل', "rarity": 'Legendary', "price": 1450, "xp": 96, "tradeable": True},
+    {"name": 'مینا آبی', "category": 'گل', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'نرگس آبی', "category": 'گل', "rarity": 'Common', "price": 84, "xp": 5, "tradeable": True},
+    {"name": 'یاس آبی', "category": 'گل', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'ارکیده آبی', "category": 'گل', "rarity": 'Epic', "price": 718, "xp": 47, "tradeable": True},
+    {"name": 'بنفشه آبی', "category": 'گل', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'میخک آبی', "category": 'گل', "rarity": 'Uncommon', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'رز بنفش', "category": 'گل', "rarity": 'Common', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'نیلوفر بنفش', "category": 'گل', "rarity": 'Uncommon', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'لاله بنفش', "category": 'گل', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'آفتابگردان بنفش', "category": 'گل', "rarity": 'Common', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'مینا بنفش', "category": 'گل', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'نرگس بنفش', "category": 'گل', "rarity": 'Common', "price": 29, "xp": 1, "tradeable": True},
+    {"name": 'یاس بنفش', "category": 'گل', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'ارکیده بنفش', "category": 'گل', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'بنفشه بنفش', "category": 'گل', "rarity": 'Legendary', "price": 925, "xp": 61, "tradeable": True},
+    {"name": 'میخک بنفش', "category": 'گل', "rarity": 'God', "price": 4475, "xp": 298, "tradeable": True},
+    {"name": 'رز طلایی', "category": 'گل', "rarity": 'Uncommon', "price": 202, "xp": 13, "tradeable": True},
+    {"name": 'نیلوفر طلایی', "category": 'گل', "rarity": 'Rare', "price": 282, "xp": 18, "tradeable": True},
+    {"name": 'لاله طلایی', "category": 'گل', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'آفتابگردان طلایی', "category": 'گل', "rarity": 'Mythic', "price": 2480, "xp": 165, "tradeable": True},
+    {"name": 'مینا طلایی', "category": 'گل', "rarity": 'Rare', "price": 144, "xp": 9, "tradeable": True},
+    {"name": 'نرگس طلایی', "category": 'گل', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'یاس طلایی', "category": 'گل', "rarity": 'Uncommon', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'ارکیده طلایی', "category": 'گل', "rarity": 'Rare', "price": 272, "xp": 18, "tradeable": True},
+    {"name": 'بنفشه طلایی', "category": 'گل', "rarity": 'Rare', "price": 147, "xp": 9, "tradeable": True},
+    {"name": 'میخک طلایی', "category": 'گل', "rarity": 'Rare', "price": 174, "xp": 11, "tradeable": True},
+    {"name": 'رز پژمرده', "category": 'گل', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'نیلوفر پژمرده', "category": 'گل', "rarity": 'Common', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'لاله پژمرده', "category": 'گل', "rarity": 'Legendary', "price": 639, "xp": 42, "tradeable": True},
+    {"name": 'آفتابگردان پژمرده', "category": 'گل', "rarity": 'Uncommon', "price": 184, "xp": 12, "tradeable": True},
+    {"name": 'مینا پژمرده', "category": 'گل', "rarity": 'Uncommon', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'نرگس پژمرده', "category": 'گل', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'یاس پژمرده', "category": 'گل', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'ارکیده پژمرده', "category": 'گل', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'بنفشه پژمرده', "category": 'گل', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'میخک پژمرده', "category": 'گل', "rarity": 'Rare', "price": 352, "xp": 23, "tradeable": True},
+    {"name": 'رز شکوفا', "category": 'گل', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'نیلوفر شکوفا', "category": 'گل', "rarity": 'Uncommon', "price": 195, "xp": 13, "tradeable": True},
+    {"name": 'لاله شکوفا', "category": 'گل', "rarity": 'Mythic', "price": 2835, "xp": 189, "tradeable": True},
+    {"name": 'آفتابگردان شکوفا', "category": 'گل', "rarity": 'Epic', "price": 440, "xp": 29, "tradeable": True},
+    {"name": 'مینا شکوفا', "category": 'گل', "rarity": 'Legendary', "price": 583, "xp": 38, "tradeable": True},
+    {"name": 'نرگس شکوفا', "category": 'گل', "rarity": 'Uncommon', "price": 145, "xp": 9, "tradeable": True},
+    {"name": 'یاس شکوفا', "category": 'گل', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'ارکیده شکوفا', "category": 'گل', "rarity": 'Uncommon', "price": 111, "xp": 7, "tradeable": True},
+    {"name": 'بنفشه شکوفا', "category": 'گل', "rarity": 'Uncommon', "price": 110, "xp": 7, "tradeable": True},
+    {"name": 'میخک شکوفا', "category": 'گل', "rarity": 'Rare', "price": 354, "xp": 23, "tradeable": True},
+    {"name": 'رز کمیاب', "category": 'گل', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'نیلوفر کمیاب', "category": 'گل', "rarity": 'Rare', "price": 191, "xp": 12, "tradeable": True},
+    {"name": 'لاله کمیاب', "category": 'گل', "rarity": 'Common', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'آفتابگردان کمیاب', "category": 'گل', "rarity": 'Common', "price": 93, "xp": 6, "tradeable": True},
+    {"name": 'مینا کمیاب', "category": 'گل', "rarity": 'Common', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'نرگس کمیاب', "category": 'گل', "rarity": 'Uncommon', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'یاس کمیاب', "category": 'گل', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'ارکیده کمیاب', "category": 'گل', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'بنفشه کمیاب', "category": 'گل', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'میخک کمیاب', "category": 'گل', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'رز معطر', "category": 'گل', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'نیلوفر معطر', "category": 'گل', "rarity": 'Common', "price": 113, "xp": 7, "tradeable": True},
+    {"name": 'لاله معطر', "category": 'گل', "rarity": 'Uncommon', "price": 231, "xp": 15, "tradeable": True},
+    {"name": 'آفتابگردان معطر', "category": 'گل', "rarity": 'Common', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'مینا معطر', "category": 'گل', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'نرگس معطر', "category": 'گل', "rarity": 'Rare', "price": 287, "xp": 19, "tradeable": True},
+    {"name": 'یاس معطر', "category": 'گل', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'ارکیده معطر', "category": 'گل', "rarity": 'Uncommon', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'بنفشه معطر', "category": 'گل', "rarity": 'Epic', "price": 786, "xp": 52, "tradeable": True},
+    {"name": 'میخک معطر', "category": 'گل', "rarity": 'Uncommon', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'رز یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'نیلوفر یخ\u200cزده', "category": 'گل', "rarity": 'Legendary', "price": 418, "xp": 27, "tradeable": True},
+    {"name": 'لاله یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'آفتابگردان یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 28, "xp": 1, "tradeable": True},
+    {"name": 'مینا یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'نرگس یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'یاس یخ\u200cزده', "category": 'گل', "rarity": 'Rare', "price": 316, "xp": 21, "tradeable": True},
+    {"name": 'ارکیده یخ\u200cزده', "category": 'گل', "rarity": 'Uncommon', "price": 131, "xp": 8, "tradeable": True},
+    {"name": 'بنفشه یخ\u200cزده', "category": 'گل', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'میخک یخ\u200cزده', "category": 'گل', "rarity": 'Uncommon', "price": 155, "xp": 10, "tradeable": True},
+    {"name": 'طلا خالص', "category": 'فلز', "rarity": 'Uncommon', "price": 212, "xp": 14, "tradeable": True},
+    {"name": 'نقره خالص', "category": 'فلز', "rarity": 'Epic', "price": 538, "xp": 35, "tradeable": True},
+    {"name": 'آهن خالص', "category": 'فلز', "rarity": 'Rare', "price": 170, "xp": 11, "tradeable": True},
+    {"name": 'مس خالص', "category": 'فلز', "rarity": 'Uncommon', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'پلاتین خالص', "category": 'فلز', "rarity": 'Uncommon', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'تیتانیوم خالص', "category": 'فلز', "rarity": 'Legendary', "price": 896, "xp": 59, "tradeable": True},
+    {"name": 'برنز خالص', "category": 'فلز', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'قلع خالص', "category": 'فلز', "rarity": 'Uncommon', "price": 129, "xp": 8, "tradeable": True},
+    {"name": 'روی خالص', "category": 'فلز', "rarity": 'Uncommon', "price": 194, "xp": 12, "tradeable": True},
+    {"name": 'فولاد خالص', "category": 'فلز', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'طلا براق', "category": 'فلز', "rarity": 'Uncommon', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'نقره براق', "category": 'فلز', "rarity": 'Rare', "price": 320, "xp": 21, "tradeable": True},
+    {"name": 'آهن براق', "category": 'فلز', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'مس براق', "category": 'فلز', "rarity": 'Uncommon', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'پلاتین براق', "category": 'فلز', "rarity": 'Rare', "price": 513, "xp": 34, "tradeable": True},
+    {"name": 'تیتانیوم براق', "category": 'فلز', "rarity": 'Legendary', "price": 737, "xp": 49, "tradeable": True},
+    {"name": 'برنز براق', "category": 'فلز', "rarity": 'Uncommon', "price": 132, "xp": 8, "tradeable": True},
+    {"name": 'قلع براق', "category": 'فلز', "rarity": 'Rare', "price": 327, "xp": 21, "tradeable": True},
+    {"name": 'روی براق', "category": 'فلز', "rarity": 'Epic', "price": 859, "xp": 57, "tradeable": True},
+    {"name": 'فولاد براق', "category": 'فلز', "rarity": 'Legendary', "price": 982, "xp": 65, "tradeable": True},
+    {"name": 'طلا زنگ\u200cزده', "category": 'فلز', "rarity": 'Mythic', "price": 2573, "xp": 171, "tradeable": True},
+    {"name": 'نقره زنگ\u200cزده', "category": 'فلز', "rarity": 'Epic', "price": 320, "xp": 21, "tradeable": True},
+    {"name": 'آهن زنگ\u200cزده', "category": 'فلز', "rarity": 'Uncommon', "price": 167, "xp": 11, "tradeable": True},
+    {"name": 'مس زنگ\u200cزده', "category": 'فلز', "rarity": 'Mythic', "price": 1060, "xp": 70, "tradeable": True},
+    {"name": 'پلاتین زنگ\u200cزده', "category": 'فلز', "rarity": 'Mythic', "price": 3035, "xp": 202, "tradeable": True},
+    {"name": 'تیتانیوم زنگ\u200cزده', "category": 'فلز', "rarity": 'Uncommon', "price": 193, "xp": 12, "tradeable": True},
+    {"name": 'برنز زنگ\u200cزده', "category": 'فلز', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'قلع زنگ\u200cزده', "category": 'فلز', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'روی زنگ\u200cزده', "category": 'فلز', "rarity": 'Rare', "price": 117, "xp": 7, "tradeable": True},
+    {"name": 'فولاد زنگ\u200cزده', "category": 'فلز', "rarity": 'Common', "price": 34, "xp": 2, "tradeable": True},
+    {"name": 'طلا کمیاب', "category": 'فلز', "rarity": 'Rare', "price": 132, "xp": 8, "tradeable": True},
+    {"name": 'نقره کمیاب', "category": 'فلز', "rarity": 'Common', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'آهن کمیاب', "category": 'فلز', "rarity": 'Common', "price": 32, "xp": 2, "tradeable": True},
+    {"name": 'مس کمیاب', "category": 'فلز', "rarity": 'God', "price": 4275, "xp": 285, "tradeable": True},
+    {"name": 'پلاتین کمیاب', "category": 'فلز', "rarity": 'Rare', "price": 304, "xp": 20, "tradeable": True},
+    {"name": 'تیتانیوم کمیاب', "category": 'فلز', "rarity": 'Rare', "price": 260, "xp": 17, "tradeable": True},
+    {"name": 'برنز کمیاب', "category": 'فلز', "rarity": 'Epic', "price": 699, "xp": 46, "tradeable": True},
+    {"name": 'قلع کمیاب', "category": 'فلز', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'روی کمیاب', "category": 'فلز', "rarity": 'Uncommon', "price": 115, "xp": 7, "tradeable": True},
+    {"name": 'فولاد کمیاب', "category": 'فلز', "rarity": 'Uncommon', "price": 153, "xp": 10, "tradeable": True},
+    {"name": 'طلا سنگین', "category": 'فلز', "rarity": 'Common', "price": 93, "xp": 6, "tradeable": True},
+    {"name": 'نقره سنگین', "category": 'فلز', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'آهن سنگین', "category": 'فلز', "rarity": 'Common', "price": 62, "xp": 4, "tradeable": True},
+    {"name": 'مس سنگین', "category": 'فلز', "rarity": 'Uncommon', "price": 110, "xp": 7, "tradeable": True},
+    {"name": 'پلاتین سنگین', "category": 'فلز', "rarity": 'Rare', "price": 447, "xp": 29, "tradeable": True},
+    {"name": 'تیتانیوم سنگین', "category": 'فلز', "rarity": 'Uncommon', "price": 179, "xp": 11, "tradeable": True},
+    {"name": 'برنز سنگین', "category": 'فلز', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'قلع سنگین', "category": 'فلز', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'روی سنگین', "category": 'فلز', "rarity": 'Epic', "price": 350, "xp": 23, "tradeable": True},
+    {"name": 'فولاد سنگین', "category": 'فلز', "rarity": 'Epic', "price": 269, "xp": 17, "tradeable": True},
+    {"name": 'طلا درخشان', "category": 'فلز', "rarity": 'Rare', "price": 173, "xp": 11, "tradeable": True},
+    {"name": 'نقره درخشان', "category": 'فلز', "rarity": 'Common', "price": 59, "xp": 3, "tradeable": True},
+    {"name": 'آهن درخشان', "category": 'فلز', "rarity": 'Epic', "price": 548, "xp": 36, "tradeable": True},
+    {"name": 'مس درخشان', "category": 'فلز', "rarity": 'Legendary', "price": 1084, "xp": 72, "tradeable": True},
+    {"name": 'پلاتین درخشان', "category": 'فلز', "rarity": 'Mythic', "price": 1584, "xp": 105, "tradeable": True},
+    {"name": 'تیتانیوم درخشان', "category": 'فلز', "rarity": 'Rare', "price": 280, "xp": 18, "tradeable": True},
+    {"name": 'برنز درخشان', "category": 'فلز', "rarity": 'Rare', "price": 402, "xp": 26, "tradeable": True},
+    {"name": 'قلع درخشان', "category": 'فلز', "rarity": 'Uncommon', "price": 130, "xp": 8, "tradeable": True},
+    {"name": 'روی درخشان', "category": 'فلز', "rarity": 'Uncommon', "price": 143, "xp": 9, "tradeable": True},
+    {"name": 'فولاد درخشان', "category": 'فلز', "rarity": 'Common', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'طلا کهن', "category": 'فلز', "rarity": 'Epic', "price": 850, "xp": 56, "tradeable": True},
+    {"name": 'نقره کهن', "category": 'فلز', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'آهن کهن', "category": 'فلز', "rarity": 'Uncommon', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'مس کهن', "category": 'فلز', "rarity": 'Common', "price": 126, "xp": 8, "tradeable": True},
+    {"name": 'پلاتین کهن', "category": 'فلز', "rarity": 'Uncommon', "price": 157, "xp": 10, "tradeable": True},
+    {"name": 'تیتانیوم کهن', "category": 'فلز', "rarity": 'Common', "price": 58, "xp": 3, "tradeable": True},
+    {"name": 'برنز کهن', "category": 'فلز', "rarity": 'Epic', "price": 800, "xp": 53, "tradeable": True},
+    {"name": 'قلع کهن', "category": 'فلز', "rarity": 'Legendary', "price": 1016, "xp": 67, "tradeable": True},
+    {"name": 'روی کهن', "category": 'فلز', "rarity": 'Epic', "price": 758, "xp": 50, "tradeable": True},
+    {"name": 'فولاد کهن', "category": 'فلز', "rarity": 'Rare', "price": 265, "xp": 17, "tradeable": True},
+    {"name": 'طلا تیره', "category": 'فلز', "rarity": 'Rare', "price": 328, "xp": 21, "tradeable": True},
+    {"name": 'نقره تیره', "category": 'فلز', "rarity": 'Epic', "price": 314, "xp": 20, "tradeable": True},
+    {"name": 'آهن تیره', "category": 'فلز', "rarity": 'Epic', "price": 397, "xp": 26, "tradeable": True},
+    {"name": 'مس تیره', "category": 'فلز', "rarity": 'Rare', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'پلاتین تیره', "category": 'فلز', "rarity": 'Epic', "price": 393, "xp": 26, "tradeable": True},
+    {"name": 'تیتانیوم تیره', "category": 'فلز', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'برنز تیره', "category": 'فلز', "rarity": 'Common', "price": 102, "xp": 6, "tradeable": True},
+    {"name": 'قلع تیره', "category": 'فلز', "rarity": 'Common', "price": 105, "xp": 7, "tradeable": True},
+    {"name": 'روی تیره', "category": 'فلز', "rarity": 'Common', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'فولاد تیره', "category": 'فلز', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'طلا خام', "category": 'فلز', "rarity": 'Epic', "price": 818, "xp": 54, "tradeable": True},
+    {"name": 'نقره خام', "category": 'فلز', "rarity": 'Legendary', "price": 812, "xp": 54, "tradeable": True},
+    {"name": 'آهن خام', "category": 'فلز', "rarity": 'Uncommon', "price": 107, "xp": 7, "tradeable": True},
+    {"name": 'مس خام', "category": 'فلز', "rarity": 'Uncommon', "price": 140, "xp": 9, "tradeable": True},
+    {"name": 'پلاتین خام', "category": 'فلز', "rarity": 'Common', "price": 98, "xp": 6, "tradeable": True},
+    {"name": 'تیتانیوم خام', "category": 'فلز', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'برنز خام', "category": 'فلز', "rarity": 'Common', "price": 45, "xp": 3, "tradeable": True},
+    {"name": 'قلع خام', "category": 'فلز', "rarity": 'Epic', "price": 230, "xp": 15, "tradeable": True},
+    {"name": 'روی خام', "category": 'فلز', "rarity": 'Common', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'فولاد خام', "category": 'فلز', "rarity": 'Uncommon', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'طلا پرداخت\u200cشده', "category": 'فلز', "rarity": 'Epic', "price": 623, "xp": 41, "tradeable": True},
+    {"name": 'نقره پرداخت\u200cشده', "category": 'فلز', "rarity": 'Epic', "price": 419, "xp": 27, "tradeable": True},
+    {"name": 'آهن پرداخت\u200cشده', "category": 'فلز', "rarity": 'Legendary', "price": 801, "xp": 53, "tradeable": True},
+    {"name": 'مس پرداخت\u200cشده', "category": 'فلز', "rarity": 'Epic', "price": 673, "xp": 44, "tradeable": True},
+    {"name": 'پلاتین پرداخت\u200cشده', "category": 'فلز', "rarity": 'Legendary', "price": 1218, "xp": 81, "tradeable": True},
+    {"name": 'تیتانیوم پرداخت\u200cشده', "category": 'فلز', "rarity": 'Uncommon', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'برنز پرداخت\u200cشده', "category": 'فلز', "rarity": 'Epic', "price": 327, "xp": 21, "tradeable": True},
+    {"name": 'قلع پرداخت\u200cشده', "category": 'فلز', "rarity": 'Uncommon', "price": 202, "xp": 13, "tradeable": True},
+    {"name": 'روی پرداخت\u200cشده', "category": 'فلز', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'فولاد پرداخت\u200cشده', "category": 'فلز', "rarity": 'Epic', "price": 764, "xp": 50, "tradeable": True},
+    {"name": 'سیب تازه', "category": 'غذا', "rarity": 'Rare', "price": 224, "xp": 14, "tradeable": True},
+    {"name": 'نان تازه', "category": 'غذا', "rarity": 'Rare', "price": 168, "xp": 11, "tradeable": True},
+    {"name": 'کیک تازه', "category": 'غذا', "rarity": 'Mythic', "price": 916, "xp": 61, "tradeable": True},
+    {"name": 'عسل تازه', "category": 'غذا', "rarity": 'Common', "price": 37, "xp": 2, "tradeable": True},
+    {"name": 'پنیر تازه', "category": 'غذا', "rarity": 'Rare', "price": 411, "xp": 27, "tradeable": True},
+    {"name": 'انار تازه', "category": 'غذا', "rarity": 'Common', "price": 76, "xp": 5, "tradeable": True},
+    {"name": 'خرما تازه', "category": 'غذا', "rarity": 'Uncommon', "price": 115, "xp": 7, "tradeable": True},
+    {"name": 'زعفران تازه', "category": 'غذا', "rarity": 'Legendary', "price": 1138, "xp": 75, "tradeable": True},
+    {"name": 'شکلات تازه', "category": 'غذا', "rarity": 'Uncommon', "price": 131, "xp": 8, "tradeable": True},
+    {"name": 'کباب تازه', "category": 'غذا', "rarity": 'Uncommon', "price": 141, "xp": 9, "tradeable": True},
+    {"name": 'سیب طلایی', "category": 'غذا', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'نان طلایی', "category": 'غذا', "rarity": 'Rare', "price": 229, "xp": 15, "tradeable": True},
+    {"name": 'کیک طلایی', "category": 'غذا', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'عسل طلایی', "category": 'غذا', "rarity": 'Legendary', "price": 1264, "xp": 84, "tradeable": True},
+    {"name": 'پنیر طلایی', "category": 'غذا', "rarity": 'Common', "price": 38, "xp": 2, "tradeable": True},
+    {"name": 'انار طلایی', "category": 'غذا', "rarity": 'Uncommon', "price": 190, "xp": 12, "tradeable": True},
+    {"name": 'خرما طلایی', "category": 'غذا', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'زعفران طلایی', "category": 'غذا', "rarity": 'Uncommon', "price": 174, "xp": 11, "tradeable": True},
+    {"name": 'شکلات طلایی', "category": 'غذا', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'کباب طلایی', "category": 'غذا', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'سیب خانگی', "category": 'غذا', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'نان خانگی', "category": 'غذا', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'کیک خانگی', "category": 'غذا', "rarity": 'Common', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'عسل خانگی', "category": 'غذا', "rarity": 'Common', "price": 38, "xp": 2, "tradeable": True},
+    {"name": 'پنیر خانگی', "category": 'غذا', "rarity": 'Legendary', "price": 1530, "xp": 102, "tradeable": True},
+    {"name": 'انار خانگی', "category": 'غذا', "rarity": 'Common', "price": 37, "xp": 2, "tradeable": True},
+    {"name": 'خرما خانگی', "category": 'غذا', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'زعفران خانگی', "category": 'غذا', "rarity": 'Uncommon', "price": 146, "xp": 9, "tradeable": True},
+    {"name": 'شکلات خانگی', "category": 'غذا', "rarity": 'Uncommon', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'کباب خانگی', "category": 'غذا', "rarity": 'Uncommon', "price": 114, "xp": 7, "tradeable": True},
+    {"name": 'سیب ترد', "category": 'غذا', "rarity": 'Common', "price": 102, "xp": 6, "tradeable": True},
+    {"name": 'نان ترد', "category": 'غذا', "rarity": 'Common', "price": 118, "xp": 7, "tradeable": True},
+    {"name": 'کیک ترد', "category": 'غذا', "rarity": 'Rare', "price": 280, "xp": 18, "tradeable": True},
+    {"name": 'عسل ترد', "category": 'غذا', "rarity": 'Epic', "price": 628, "xp": 41, "tradeable": True},
+    {"name": 'پنیر ترد', "category": 'غذا', "rarity": 'Legendary', "price": 904, "xp": 60, "tradeable": True},
+    {"name": 'انار ترد', "category": 'غذا', "rarity": 'Uncommon', "price": 162, "xp": 10, "tradeable": True},
+    {"name": 'خرما ترد', "category": 'غذا', "rarity": 'Rare', "price": 228, "xp": 15, "tradeable": True},
+    {"name": 'زعفران ترد', "category": 'غذا', "rarity": 'Common', "price": 45, "xp": 3, "tradeable": True},
+    {"name": 'شکلات ترد', "category": 'غذا', "rarity": 'Rare', "price": 372, "xp": 24, "tradeable": True},
+    {"name": 'کباب ترد', "category": 'غذا', "rarity": 'Common', "price": 62, "xp": 4, "tradeable": True},
+    {"name": 'سیب شیرین', "category": 'غذا', "rarity": 'Rare', "price": 401, "xp": 26, "tradeable": True},
+    {"name": 'نان شیرین', "category": 'غذا', "rarity": 'Common', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'کیک شیرین', "category": 'غذا', "rarity": 'Uncommon', "price": 177, "xp": 11, "tradeable": True},
+    {"name": 'عسل شیرین', "category": 'غذا', "rarity": 'Rare', "price": 349, "xp": 23, "tradeable": True},
+    {"name": 'پنیر شیرین', "category": 'غذا', "rarity": 'Epic', "price": 273, "xp": 18, "tradeable": True},
+    {"name": 'انار شیرین', "category": 'غذا', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'خرما شیرین', "category": 'غذا', "rarity": 'Uncommon', "price": 207, "xp": 13, "tradeable": True},
+    {"name": 'زعفران شیرین', "category": 'غذا', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'شکلات شیرین', "category": 'غذا', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'کباب شیرین', "category": 'غذا', "rarity": 'Uncommon', "price": 118, "xp": 7, "tradeable": True},
+    {"name": 'سیب تند', "category": 'غذا', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'نان تند', "category": 'غذا', "rarity": 'Secret', "price": 9306, "xp": 620, "tradeable": True},
+    {"name": 'کیک تند', "category": 'غذا', "rarity": 'Uncommon', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'عسل تند', "category": 'غذا', "rarity": 'Legendary', "price": 701, "xp": 46, "tradeable": True},
+    {"name": 'پنیر تند', "category": 'غذا', "rarity": 'Common', "price": 59, "xp": 3, "tradeable": True},
+    {"name": 'انار تند', "category": 'غذا', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'خرما تند', "category": 'غذا', "rarity": 'Rare', "price": 233, "xp": 15, "tradeable": True},
+    {"name": 'زعفران تند', "category": 'غذا', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'شکلات تند', "category": 'غذا', "rarity": 'Common', "price": 48, "xp": 3, "tradeable": True},
+    {"name": 'کباب تند', "category": 'غذا', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'سیب خوشمزه', "category": 'غذا', "rarity": 'Uncommon', "price": 155, "xp": 10, "tradeable": True},
+    {"name": 'نان خوشمزه', "category": 'غذا', "rarity": 'Legendary', "price": 1061, "xp": 70, "tradeable": True},
+    {"name": 'کیک خوشمزه', "category": 'غذا', "rarity": 'Uncommon', "price": 118, "xp": 7, "tradeable": True},
+    {"name": 'عسل خوشمزه', "category": 'غذا', "rarity": 'Uncommon', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'پنیر خوشمزه', "category": 'غذا', "rarity": 'Epic', "price": 762, "xp": 50, "tradeable": True},
+    {"name": 'انار خوشمزه', "category": 'غذا', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'خرما خوشمزه', "category": 'غذا', "rarity": 'Rare', "price": 165, "xp": 11, "tradeable": True},
+    {"name": 'زعفران خوشمزه', "category": 'غذا', "rarity": 'Rare', "price": 350, "xp": 23, "tradeable": True},
+    {"name": 'شکلات خوشمزه', "category": 'غذا', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'کباب خوشمزه', "category": 'غذا', "rarity": 'Rare', "price": 391, "xp": 26, "tradeable": True},
+    {"name": 'سیب کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 174, "xp": 11, "tradeable": True},
+    {"name": 'نان کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 144, "xp": 9, "tradeable": True},
+    {"name": 'کیک کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 125, "xp": 8, "tradeable": True},
+    {"name": 'عسل کمیاب', "category": 'غذا', "rarity": 'Rare', "price": 342, "xp": 22, "tradeable": True},
+    {"name": 'پنیر کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'انار کمیاب', "category": 'غذا', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'خرما کمیاب', "category": 'غذا', "rarity": 'Rare', "price": 377, "xp": 25, "tradeable": True},
+    {"name": 'زعفران کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 159, "xp": 10, "tradeable": True},
+    {"name": 'شکلات کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 224, "xp": 14, "tradeable": True},
+    {"name": 'کباب کمیاب', "category": 'غذا', "rarity": 'Uncommon', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'سیب سنتی', "category": 'غذا', "rarity": 'Uncommon', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'نان سنتی', "category": 'غذا', "rarity": 'Epic', "price": 355, "xp": 23, "tradeable": True},
+    {"name": 'کیک سنتی', "category": 'غذا', "rarity": 'Legendary', "price": 1198, "xp": 79, "tradeable": True},
+    {"name": 'عسل سنتی', "category": 'غذا', "rarity": 'Epic', "price": 847, "xp": 56, "tradeable": True},
+    {"name": 'پنیر سنتی', "category": 'غذا', "rarity": 'Uncommon', "price": 185, "xp": 12, "tradeable": True},
+    {"name": 'انار سنتی', "category": 'غذا', "rarity": 'Epic', "price": 650, "xp": 43, "tradeable": True},
+    {"name": 'خرما سنتی', "category": 'غذا', "rarity": 'Uncommon', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'زعفران سنتی', "category": 'غذا', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'شکلات سنتی', "category": 'غذا', "rarity": 'Rare', "price": 399, "xp": 26, "tradeable": True},
+    {"name": 'کباب سنتی', "category": 'غذا', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'سیب ویژه', "category": 'غذا', "rarity": 'Uncommon', "price": 162, "xp": 10, "tradeable": True},
+    {"name": 'نان ویژه', "category": 'غذا', "rarity": 'Rare', "price": 369, "xp": 24, "tradeable": True},
+    {"name": 'کیک ویژه', "category": 'غذا', "rarity": 'Mythic', "price": 1506, "xp": 100, "tradeable": True},
+    {"name": 'عسل ویژه', "category": 'غذا', "rarity": 'Rare', "price": 231, "xp": 15, "tradeable": True},
+    {"name": 'پنیر ویژه', "category": 'غذا', "rarity": 'Secret', "price": 9723, "xp": 648, "tradeable": True},
+    {"name": 'انار ویژه', "category": 'غذا', "rarity": 'Epic', "price": 334, "xp": 22, "tradeable": True},
+    {"name": 'خرما ویژه', "category": 'غذا', "rarity": 'God', "price": 3257, "xp": 217, "tradeable": True},
+    {"name": 'زعفران ویژه', "category": 'غذا', "rarity": 'Rare', "price": 364, "xp": 24, "tradeable": True},
+    {"name": 'شکلات ویژه', "category": 'غذا', "rarity": 'Uncommon', "price": 148, "xp": 9, "tradeable": True},
+    {"name": 'کباب ویژه', "category": 'غذا', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'چکش آهنین', "category": 'وسیله', "rarity": 'Epic', "price": 631, "xp": 42, "tradeable": True},
+    {"name": 'طناب آهنین', "category": 'وسیله', "rarity": 'Uncommon', "price": 98, "xp": 6, "tradeable": True},
+    {"name": 'چراغ آهنین', "category": 'وسیله', "rarity": 'Rare', "price": 291, "xp": 19, "tradeable": True},
+    {"name": 'قطب\u200cنما آهنین', "category": 'وسیله', "rarity": 'Legendary', "price": 1842, "xp": 122, "tradeable": True},
+    {"name": 'کوله\u200cپشتی آهنین', "category": 'وسیله', "rarity": 'Rare', "price": 145, "xp": 9, "tradeable": True},
+    {"name": 'کلید آهنین', "category": 'وسیله', "rarity": 'Rare', "price": 413, "xp": 27, "tradeable": True},
+    {"name": 'ساعت آهنین', "category": 'وسیله', "rarity": 'God', "price": 3175, "xp": 211, "tradeable": True},
+    {"name": 'دوربین آهنین', "category": 'وسیله', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'چتر آهنین', "category": 'وسیله', "rarity": 'Epic', "price": 668, "xp": 44, "tradeable": True},
+    {"name": 'عصا آهنین', "category": 'وسیله', "rarity": 'Uncommon', "price": 142, "xp": 9, "tradeable": True},
+    {"name": 'چکش چوبی', "category": 'وسیله', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'طناب چوبی', "category": 'وسیله', "rarity": 'Epic', "price": 328, "xp": 21, "tradeable": True},
+    {"name": 'چراغ چوبی', "category": 'وسیله', "rarity": 'Rare', "price": 316, "xp": 21, "tradeable": True},
+    {"name": 'قطب\u200cنما چوبی', "category": 'وسیله', "rarity": 'Uncommon', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'کوله\u200cپشتی چوبی', "category": 'وسیله', "rarity": 'Epic', "price": 382, "xp": 25, "tradeable": True},
+    {"name": 'کلید چوبی', "category": 'وسیله', "rarity": 'Uncommon', "price": 183, "xp": 12, "tradeable": True},
+    {"name": 'ساعت چوبی', "category": 'وسیله', "rarity": 'Rare', "price": 290, "xp": 19, "tradeable": True},
+    {"name": 'دوربین چوبی', "category": 'وسیله', "rarity": 'Uncommon', "price": 119, "xp": 7, "tradeable": True},
+    {"name": 'چتر چوبی', "category": 'وسیله', "rarity": 'Common', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'عصا چوبی', "category": 'وسیله', "rarity": 'Uncommon', "price": 219, "xp": 14, "tradeable": True},
+    {"name": 'چکش جادویی', "category": 'وسیله', "rarity": 'Epic', "price": 237, "xp": 15, "tradeable": True},
+    {"name": 'طناب جادویی', "category": 'وسیله', "rarity": 'Uncommon', "price": 142, "xp": 9, "tradeable": True},
+    {"name": 'چراغ جادویی', "category": 'وسیله', "rarity": 'Legendary', "price": 765, "xp": 51, "tradeable": True},
+    {"name": 'قطب\u200cنما جادویی', "category": 'وسیله', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'کوله\u200cپشتی جادویی', "category": 'وسیله', "rarity": 'Rare', "price": 228, "xp": 15, "tradeable": True},
+    {"name": 'کلید جادویی', "category": 'وسیله', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'ساعت جادویی', "category": 'وسیله', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'دوربین جادویی', "category": 'وسیله', "rarity": 'Legendary', "price": 631, "xp": 42, "tradeable": True},
+    {"name": 'چتر جادویی', "category": 'وسیله', "rarity": 'Uncommon', "price": 119, "xp": 7, "tradeable": True},
+    {"name": 'عصا جادویی', "category": 'وسیله', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'چکش قدیمی', "category": 'وسیله', "rarity": 'Uncommon', "price": 100, "xp": 6, "tradeable": True},
+    {"name": 'طناب قدیمی', "category": 'وسیله', "rarity": 'Uncommon', "price": 138, "xp": 9, "tradeable": True},
+    {"name": 'چراغ قدیمی', "category": 'وسیله', "rarity": 'Rare', "price": 232, "xp": 15, "tradeable": True},
+    {"name": 'قطب\u200cنما قدیمی', "category": 'وسیله', "rarity": 'Uncommon', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'کوله\u200cپشتی قدیمی', "category": 'وسیله', "rarity": 'Common', "price": 47, "xp": 3, "tradeable": True},
+    {"name": 'کلید قدیمی', "category": 'وسیله', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'ساعت قدیمی', "category": 'وسیله', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'دوربین قدیمی', "category": 'وسیله', "rarity": 'Rare', "price": 210, "xp": 14, "tradeable": True},
+    {"name": 'چتر قدیمی', "category": 'وسیله', "rarity": 'Rare', "price": 161, "xp": 10, "tradeable": True},
+    {"name": 'عصا قدیمی', "category": 'وسیله', "rarity": 'Common', "price": 52, "xp": 3, "tradeable": True},
+    {"name": 'چکش دست\u200cساز', "category": 'وسیله', "rarity": 'Rare', "price": 246, "xp": 16, "tradeable": True},
+    {"name": 'طناب دست\u200cساز', "category": 'وسیله', "rarity": 'Uncommon', "price": 211, "xp": 14, "tradeable": True},
+    {"name": 'چراغ دست\u200cساز', "category": 'وسیله', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'قطب\u200cنما دست\u200cساز', "category": 'وسیله', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'کوله\u200cپشتی دست\u200cساز', "category": 'وسیله', "rarity": 'Uncommon', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'کلید دست\u200cساز', "category": 'وسیله', "rarity": 'Uncommon', "price": 131, "xp": 8, "tradeable": True},
+    {"name": 'ساعت دست\u200cساز', "category": 'وسیله', "rarity": 'Uncommon', "price": 157, "xp": 10, "tradeable": True},
+    {"name": 'دوربین دست\u200cساز', "category": 'وسیله', "rarity": 'Rare', "price": 245, "xp": 16, "tradeable": True},
+    {"name": 'چتر دست\u200cساز', "category": 'وسیله', "rarity": 'Uncommon', "price": 126, "xp": 8, "tradeable": True},
+    {"name": 'عصا دست\u200cساز', "category": 'وسیله', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'چکش شکسته', "category": 'وسیله', "rarity": 'Rare', "price": 251, "xp": 16, "tradeable": True},
+    {"name": 'طناب شکسته', "category": 'وسیله', "rarity": 'Common', "price": 104, "xp": 6, "tradeable": True},
+    {"name": 'چراغ شکسته', "category": 'وسیله', "rarity": 'Common', "price": 40, "xp": 2, "tradeable": True},
+    {"name": 'قطب\u200cنما شکسته', "category": 'وسیله', "rarity": 'Legendary', "price": 685, "xp": 45, "tradeable": True},
+    {"name": 'کوله\u200cپشتی شکسته', "category": 'وسیله', "rarity": 'Epic', "price": 652, "xp": 43, "tradeable": True},
+    {"name": 'کلید شکسته', "category": 'وسیله', "rarity": 'Rare', "price": 459, "xp": 30, "tradeable": True},
+    {"name": 'ساعت شکسته', "category": 'وسیله', "rarity": 'Rare', "price": 139, "xp": 9, "tradeable": True},
+    {"name": 'دوربین شکسته', "category": 'وسیله', "rarity": 'Common', "price": 46, "xp": 3, "tradeable": True},
+    {"name": 'چتر شکسته', "category": 'وسیله', "rarity": 'Common', "price": 84, "xp": 5, "tradeable": True},
+    {"name": 'عصا شکسته', "category": 'وسیله', "rarity": 'Uncommon', "price": 222, "xp": 14, "tradeable": True},
+    {"name": 'چکش براق', "category": 'وسیله', "rarity": 'Uncommon', "price": 136, "xp": 9, "tradeable": True},
+    {"name": 'طناب براق', "category": 'وسیله', "rarity": 'Uncommon', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'چراغ براق', "category": 'وسیله', "rarity": 'Common', "price": 119, "xp": 7, "tradeable": True},
+    {"name": 'قطب\u200cنما براق', "category": 'وسیله', "rarity": 'Mythic', "price": 1570, "xp": 104, "tradeable": True},
+    {"name": 'کوله\u200cپشتی براق', "category": 'وسیله', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'کلید براق', "category": 'وسیله', "rarity": 'Uncommon', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'ساعت براق', "category": 'وسیله', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'دوربین براق', "category": 'وسیله', "rarity": 'Uncommon', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'چتر براق', "category": 'وسیله', "rarity": 'Rare', "price": 178, "xp": 11, "tradeable": True},
+    {"name": 'عصا براق', "category": 'وسیله', "rarity": 'Rare', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'چکش زنگ\u200cزده', "category": 'وسیله', "rarity": 'Legendary', "price": 1524, "xp": 101, "tradeable": True},
+    {"name": 'طناب زنگ\u200cزده', "category": 'وسیله', "rarity": 'Epic', "price": 445, "xp": 29, "tradeable": True},
+    {"name": 'چراغ زنگ\u200cزده', "category": 'وسیله', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'قطب\u200cنما زنگ\u200cزده', "category": 'وسیله', "rarity": 'Common', "price": 31, "xp": 2, "tradeable": True},
+    {"name": 'کوله\u200cپشتی زنگ\u200cزده', "category": 'وسیله', "rarity": 'Uncommon', "price": 161, "xp": 10, "tradeable": True},
+    {"name": 'کلید زنگ\u200cزده', "category": 'وسیله', "rarity": 'Rare', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'ساعت زنگ\u200cزده', "category": 'وسیله', "rarity": 'Uncommon', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'دوربین زنگ\u200cزده', "category": 'وسیله', "rarity": 'Uncommon', "price": 135, "xp": 9, "tradeable": True},
+    {"name": 'چتر زنگ\u200cزده', "category": 'وسیله', "rarity": 'Rare', "price": 160, "xp": 10, "tradeable": True},
+    {"name": 'عصا زنگ\u200cزده', "category": 'وسیله', "rarity": 'Uncommon', "price": 86, "xp": 5, "tradeable": True},
+    {"name": 'چکش کارآمد', "category": 'وسیله', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'طناب کارآمد', "category": 'وسیله', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'چراغ کارآمد', "category": 'وسیله', "rarity": 'Legendary', "price": 548, "xp": 36, "tradeable": True},
+    {"name": 'قطب\u200cنما کارآمد', "category": 'وسیله', "rarity": 'Legendary', "price": 1135, "xp": 75, "tradeable": True},
+    {"name": 'کوله\u200cپشتی کارآمد', "category": 'وسیله', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'کلید کارآمد', "category": 'وسیله', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'ساعت کارآمد', "category": 'وسیله', "rarity": 'Rare', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'دوربین کارآمد', "category": 'وسیله', "rarity": 'Epic', "price": 357, "xp": 23, "tradeable": True},
+    {"name": 'چتر کارآمد', "category": 'وسیله', "rarity": 'Common', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'عصا کارآمد', "category": 'وسیله', "rarity": 'Rare', "price": 265, "xp": 17, "tradeable": True},
+    {"name": 'چکش مرموز', "category": 'وسیله', "rarity": 'Uncommon', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'طناب مرموز', "category": 'وسیله', "rarity": 'Common', "price": 79, "xp": 5, "tradeable": True},
+    {"name": 'چراغ مرموز', "category": 'وسیله', "rarity": 'Common', "price": 84, "xp": 5, "tradeable": True},
+    {"name": 'قطب\u200cنما مرموز', "category": 'وسیله', "rarity": 'Uncommon', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'کوله\u200cپشتی مرموز', "category": 'وسیله', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'کلید مرموز', "category": 'وسیله', "rarity": 'Legendary', "price": 453, "xp": 30, "tradeable": True},
+    {"name": 'ساعت مرموز', "category": 'وسیله', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'دوربین مرموز', "category": 'وسیله', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'چتر مرموز', "category": 'وسیله', "rarity": 'Rare', "price": 155, "xp": 10, "tradeable": True},
+    {"name": 'عصا مرموز', "category": 'وسیله', "rarity": 'Mythic', "price": 2604, "xp": 173, "tradeable": True},
+    {"name": 'پادشاه گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'ملکه گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'قهرمان گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'جادوگر بزرگ گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Rare', "price": 176, "xp": 11, "tradeable": True},
+    {"name": 'پیامبر رویا گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 133, "xp": 8, "tradeable": True},
+    {"name": 'نگهبان دروازه گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 192, "xp": 12, "tradeable": True},
+    {"name": 'روح جنگاور گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 62, "xp": 4, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان گمشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'پادشاه افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Rare', "price": 287, "xp": 19, "tradeable": True},
+    {"name": 'ملکه افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 47, "xp": 3, "tradeable": True},
+    {"name": 'قهرمان افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Rare', "price": 150, "xp": 10, "tradeable": True},
+    {"name": 'جادوگر بزرگ افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'پیامبر رویا افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'نگهبان دروازه افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 71, "xp": 4, "tradeable": True},
+    {"name": 'روح جنگاور افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 288, "xp": 19, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان افسانه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Rare', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'پادشاه ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 324, "xp": 21, "tradeable": True},
+    {"name": 'ملکه ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'قهرمان ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'جادوگر بزرگ ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'God', "price": 2526, "xp": 168, "tradeable": True},
+    {"name": 'پیامبر رویا ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 739, "xp": 49, "tradeable": True},
+    {"name": 'نگهبان دروازه ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'روح جنگاور ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان ابدی', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 704, "xp": 46, "tradeable": True},
+    {"name": 'پادشاه سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Legendary', "price": 654, "xp": 43, "tradeable": True},
+    {"name": 'ملکه سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 31, "xp": 2, "tradeable": True},
+    {"name": 'قهرمان سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'جادوگر بزرگ سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 62, "xp": 4, "tradeable": True},
+    {"name": 'پیامبر رویا سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Legendary', "price": 477, "xp": 31, "tradeable": True},
+    {"name": 'نگهبان دروازه سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 167, "xp": 11, "tradeable": True},
+    {"name": 'روح جنگاور سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان سایه\u200cای', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'پادشاه نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'ملکه نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 137, "xp": 9, "tradeable": True},
+    {"name": 'قهرمان نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 207, "xp": 13, "tradeable": True},
+    {"name": 'جادوگر بزرگ نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'پیامبر رویا نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'نگهبان دروازه نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'God', "price": 7112, "xp": 474, "tradeable": True},
+    {"name": 'روح جنگاور نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Mythic', "price": 2339, "xp": 155, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان نفرین\u200cشده', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Rare', "price": 371, "xp": 24, "tradeable": True},
+    {"name": 'پادشاه درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 147, "xp": 9, "tradeable": True},
+    {"name": 'ملکه درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 47, "xp": 3, "tradeable": True},
+    {"name": 'قهرمان درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 431, "xp": 28, "tradeable": True},
+    {"name": 'جادوگر بزرگ درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'God', "price": 5696, "xp": 379, "tradeable": True},
+    {"name": 'پیامبر رویا درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 151, "xp": 10, "tradeable": True},
+    {"name": 'نگهبان دروازه درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'روح جنگاور درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 349, "xp": 23, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان درخشان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Legendary', "price": 1158, "xp": 77, "tradeable": True},
+    {"name": 'پادشاه خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 369, "xp": 24, "tradeable": True},
+    {"name": 'ملکه خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 188, "xp": 12, "tradeable": True},
+    {"name": 'قهرمان خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'جادوگر بزرگ خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 131, "xp": 8, "tradeable": True},
+    {"name": 'پیامبر رویا خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 796, "xp": 53, "tradeable": True},
+    {"name": 'نگهبان دروازه خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 28, "xp": 1, "tradeable": True},
+    {"name": 'روح جنگاور خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 46, "xp": 3, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان خاموش', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Uncommon', "price": 181, "xp": 12, "tradeable": True},
+    {"name": 'پادشاه پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'ملکه پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 58, "xp": 3, "tradeable": True},
+    {"name": 'قهرمان پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'جادوگر بزرگ پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Epic', "price": 778, "xp": 51, "tradeable": True},
+    {"name": 'پیامبر رویا پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'نگهبان دروازه پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'روح جنگاور پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Common', "price": 101, "xp": 6, "tradeable": True},
+    {"name": 'اسطوره\u200cی کوهستان پنهان', "category": 'شخصیت\u200cافسانه\u200cای', "rarity": 'Mythic', "price": 1862, "xp": 124, "tradeable": True},
+    {"name": 'مریخ سرخ', "category": 'سیاره', "rarity": 'Mythic', "price": 2051, "xp": 136, "tradeable": True},
+    {"name": 'زحل سرخ', "category": 'سیاره', "rarity": 'Uncommon', "price": 102, "xp": 6, "tradeable": True},
+    {"name": 'مشتری سرخ', "category": 'سیاره', "rarity": 'Rare', "price": 231, "xp": 15, "tradeable": True},
+    {"name": 'نپتون سرخ', "category": 'سیاره', "rarity": 'Rare', "price": 392, "xp": 26, "tradeable": True},
+    {"name": 'اورانوس سرخ', "category": 'سیاره', "rarity": 'Rare', "price": 121, "xp": 8, "tradeable": True},
+    {"name": 'عطارد سرخ', "category": 'سیاره', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'زهره سرخ', "category": 'سیاره', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'پلوتو سرخ', "category": 'سیاره', "rarity": 'Rare', "price": 233, "xp": 15, "tradeable": True},
+    {"name": 'مریخ یخی', "category": 'سیاره', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'زحل یخی', "category": 'سیاره', "rarity": 'Rare', "price": 294, "xp": 19, "tradeable": True},
+    {"name": 'مشتری یخی', "category": 'سیاره', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'نپتون یخی', "category": 'سیاره', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'اورانوس یخی', "category": 'سیاره', "rarity": 'Common', "price": 100, "xp": 6, "tradeable": True},
+    {"name": 'عطارد یخی', "category": 'سیاره', "rarity": 'Mythic', "price": 2574, "xp": 171, "tradeable": True},
+    {"name": 'زهره یخی', "category": 'سیاره', "rarity": 'Common', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'پلوتو یخی', "category": 'سیاره', "rarity": 'Epic', "price": 408, "xp": 27, "tradeable": True},
+    {"name": 'مریخ حلقه\u200cدار', "category": 'سیاره', "rarity": 'Common', "price": 32, "xp": 2, "tradeable": True},
+    {"name": 'زحل حلقه\u200cدار', "category": 'سیاره', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'مشتری حلقه\u200cدار', "category": 'سیاره', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'نپتون حلقه\u200cدار', "category": 'سیاره', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'اورانوس حلقه\u200cدار', "category": 'سیاره', "rarity": 'Mythic', "price": 3145, "xp": 209, "tradeable": True},
+    {"name": 'عطارد حلقه\u200cدار', "category": 'سیاره', "rarity": 'Uncommon', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'زهره حلقه\u200cدار', "category": 'سیاره', "rarity": 'Uncommon', "price": 61, "xp": 4, "tradeable": True},
+    {"name": 'پلوتو حلقه\u200cدار', "category": 'سیاره', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'مریخ غول\u200cپیکر', "category": 'سیاره', "rarity": 'Uncommon', "price": 184, "xp": 12, "tradeable": True},
+    {"name": 'زحل غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 50, "xp": 3, "tradeable": True},
+    {"name": 'مشتری غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 121, "xp": 8, "tradeable": True},
+    {"name": 'نپتون غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'اورانوس غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'عطارد غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'زهره غول\u200cپیکر', "category": 'سیاره', "rarity": 'Mythic', "price": 3299, "xp": 219, "tradeable": True},
+    {"name": 'پلوتو غول\u200cپیکر', "category": 'سیاره', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'مریخ دوردست', "category": 'سیاره', "rarity": 'Epic', "price": 426, "xp": 28, "tradeable": True},
+    {"name": 'زحل دوردست', "category": 'سیاره', "rarity": 'Uncommon', "price": 104, "xp": 6, "tradeable": True},
+    {"name": 'مشتری دوردست', "category": 'سیاره', "rarity": 'Common', "price": 54, "xp": 3, "tradeable": True},
+    {"name": 'نپتون دوردست', "category": 'سیاره', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'اورانوس دوردست', "category": 'سیاره', "rarity": 'Epic', "price": 259, "xp": 17, "tradeable": True},
+    {"name": 'عطارد دوردست', "category": 'سیاره', "rarity": 'Rare', "price": 141, "xp": 9, "tradeable": True},
+    {"name": 'زهره دوردست', "category": 'سیاره', "rarity": 'Common', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'پلوتو دوردست', "category": 'سیاره', "rarity": 'Rare', "price": 254, "xp": 16, "tradeable": True},
+    {"name": 'مریخ سوزان', "category": 'سیاره', "rarity": 'Epic', "price": 775, "xp": 51, "tradeable": True},
+    {"name": 'زحل سوزان', "category": 'سیاره', "rarity": 'Uncommon', "price": 195, "xp": 13, "tradeable": True},
+    {"name": 'مشتری سوزان', "category": 'سیاره', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'نپتون سوزان', "category": 'سیاره', "rarity": 'Legendary', "price": 536, "xp": 35, "tradeable": True},
+    {"name": 'اورانوس سوزان', "category": 'سیاره', "rarity": 'Legendary', "price": 619, "xp": 41, "tradeable": True},
+    {"name": 'عطارد سوزان', "category": 'سیاره', "rarity": 'Rare', "price": 265, "xp": 17, "tradeable": True},
+    {"name": 'زهره سوزان', "category": 'سیاره', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'پلوتو سوزان', "category": 'سیاره', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'مریخ آبی', "category": 'سیاره', "rarity": 'Rare', "price": 285, "xp": 19, "tradeable": True},
+    {"name": 'زحل آبی', "category": 'سیاره', "rarity": 'Uncommon', "price": 120, "xp": 8, "tradeable": True},
+    {"name": 'مشتری آبی', "category": 'سیاره', "rarity": 'Rare', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'نپتون آبی', "category": 'سیاره', "rarity": 'Uncommon', "price": 192, "xp": 12, "tradeable": True},
+    {"name": 'اورانوس آبی', "category": 'سیاره', "rarity": 'Common', "price": 110, "xp": 7, "tradeable": True},
+    {"name": 'عطارد آبی', "category": 'سیاره', "rarity": 'Common', "price": 114, "xp": 7, "tradeable": True},
+    {"name": 'زهره آبی', "category": 'سیاره', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'پلوتو آبی', "category": 'سیاره', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'مریخ پنهان', "category": 'سیاره', "rarity": 'Uncommon', "price": 100, "xp": 6, "tradeable": True},
+    {"name": 'زحل پنهان', "category": 'سیاره', "rarity": 'Epic', "price": 733, "xp": 48, "tradeable": True},
+    {"name": 'مشتری پنهان', "category": 'سیاره', "rarity": 'Common', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'نپتون پنهان', "category": 'سیاره', "rarity": 'Uncommon', "price": 97, "xp": 6, "tradeable": True},
+    {"name": 'اورانوس پنهان', "category": 'سیاره', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'عطارد پنهان', "category": 'سیاره', "rarity": 'Epic', "price": 659, "xp": 43, "tradeable": True},
+    {"name": 'زهره پنهان', "category": 'سیاره', "rarity": 'Common', "price": 113, "xp": 7, "tradeable": True},
+    {"name": 'پلوتو پنهان', "category": 'سیاره', "rarity": 'Epic', "price": 248, "xp": 16, "tradeable": True},
+    {"name": 'الماس براق', "category": 'سنگ', "rarity": 'Rare', "price": 259, "xp": 17, "tradeable": True},
+    {"name": 'یاقوت براق', "category": 'سنگ', "rarity": 'Uncommon', "price": 108, "xp": 7, "tradeable": True},
+    {"name": 'زمرد براق', "category": 'سنگ', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود براق', "category": 'سنگ', "rarity": 'Uncommon', "price": 132, "xp": 8, "tradeable": True},
+    {"name": 'فیروزه براق', "category": 'سنگ', "rarity": 'Uncommon', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'کهربا براق', "category": 'سنگ', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'عقیق براق', "category": 'سنگ', "rarity": 'Rare', "price": 372, "xp": 24, "tradeable": True},
+    {"name": 'مروارید براق', "category": 'سنگ', "rarity": 'Uncommon', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'الماس خام', "category": 'سنگ', "rarity": 'Rare', "price": 281, "xp": 18, "tradeable": True},
+    {"name": 'یاقوت خام', "category": 'سنگ', "rarity": 'Epic', "price": 234, "xp": 15, "tradeable": True},
+    {"name": 'زمرد خام', "category": 'سنگ', "rarity": 'Epic', "price": 536, "xp": 35, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود خام', "category": 'سنگ', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'فیروزه خام', "category": 'سنگ', "rarity": 'Common', "price": 51, "xp": 3, "tradeable": True},
+    {"name": 'کهربا خام', "category": 'سنگ', "rarity": 'Epic', "price": 750, "xp": 50, "tradeable": True},
+    {"name": 'عقیق خام', "category": 'سنگ', "rarity": 'Legendary', "price": 455, "xp": 30, "tradeable": True},
+    {"name": 'مروارید خام', "category": 'سنگ', "rarity": 'Uncommon', "price": 154, "xp": 10, "tradeable": True},
+    {"name": 'الماس کمیاب', "category": 'سنگ', "rarity": 'Epic', "price": 779, "xp": 51, "tradeable": True},
+    {"name": 'یاقوت کمیاب', "category": 'سنگ', "rarity": 'Common', "price": 73, "xp": 4, "tradeable": True},
+    {"name": 'زمرد کمیاب', "category": 'سنگ', "rarity": 'Rare', "price": 214, "xp": 14, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود کمیاب', "category": 'سنگ', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'فیروزه کمیاب', "category": 'سنگ', "rarity": 'Uncommon', "price": 104, "xp": 6, "tradeable": True},
+    {"name": 'کهربا کمیاب', "category": 'سنگ', "rarity": 'Uncommon', "price": 78, "xp": 5, "tradeable": True},
+    {"name": 'عقیق کمیاب', "category": 'سنگ', "rarity": 'Mythic', "price": 964, "xp": 64, "tradeable": True},
+    {"name": 'مروارید کمیاب', "category": 'سنگ', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'الماس شفاف', "category": 'سنگ', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'یاقوت شفاف', "category": 'سنگ', "rarity": 'Legendary', "price": 986, "xp": 65, "tradeable": True},
+    {"name": 'زمرد شفاف', "category": 'سنگ', "rarity": 'Common', "price": 76, "xp": 5, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود شفاف', "category": 'سنگ', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'فیروزه شفاف', "category": 'سنگ', "rarity": 'Epic', "price": 699, "xp": 46, "tradeable": True},
+    {"name": 'کهربا شفاف', "category": 'سنگ', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'عقیق شفاف', "category": 'سنگ', "rarity": 'Uncommon', "price": 125, "xp": 8, "tradeable": True},
+    {"name": 'مروارید شفاف', "category": 'سنگ', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'الماس تیره', "category": 'سنگ', "rarity": 'Common', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'یاقوت تیره', "category": 'سنگ', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'زمرد تیره', "category": 'سنگ', "rarity": 'Uncommon', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود تیره', "category": 'سنگ', "rarity": 'Epic', "price": 732, "xp": 48, "tradeable": True},
+    {"name": 'فیروزه تیره', "category": 'سنگ', "rarity": 'Rare', "price": 148, "xp": 9, "tradeable": True},
+    {"name": 'کهربا تیره', "category": 'سنگ', "rarity": 'God', "price": 4738, "xp": 315, "tradeable": True},
+    {"name": 'عقیق تیره', "category": 'سنگ', "rarity": 'Uncommon', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'مروارید تیره', "category": 'سنگ', "rarity": 'God', "price": 3147, "xp": 209, "tradeable": True},
+    {"name": 'الماس درخشان', "category": 'سنگ', "rarity": 'Rare', "price": 438, "xp": 29, "tradeable": True},
+    {"name": 'یاقوت درخشان', "category": 'سنگ', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'زمرد درخشان', "category": 'سنگ', "rarity": 'Epic', "price": 401, "xp": 26, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود درخشان', "category": 'سنگ', "rarity": 'Uncommon', "price": 146, "xp": 9, "tradeable": True},
+    {"name": 'فیروزه درخشان', "category": 'سنگ', "rarity": 'Uncommon', "price": 134, "xp": 8, "tradeable": True},
+    {"name": 'کهربا درخشان', "category": 'سنگ', "rarity": 'Epic', "price": 298, "xp": 19, "tradeable": True},
+    {"name": 'عقیق درخشان', "category": 'سنگ', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'مروارید درخشان', "category": 'سنگ', "rarity": 'Epic', "price": 573, "xp": 38, "tradeable": True},
+    {"name": 'الماس کهن', "category": 'سنگ', "rarity": 'Common', "price": 46, "xp": 3, "tradeable": True},
+    {"name": 'یاقوت کهن', "category": 'سنگ', "rarity": 'Epic', "price": 323, "xp": 21, "tradeable": True},
+    {"name": 'زمرد کهن', "category": 'سنگ', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود کهن', "category": 'سنگ', "rarity": 'Common', "price": 68, "xp": 4, "tradeable": True},
+    {"name": 'فیروزه کهن', "category": 'سنگ', "rarity": 'Epic', "price": 340, "xp": 22, "tradeable": True},
+    {"name": 'کهربا کهن', "category": 'سنگ', "rarity": 'Common', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'عقیق کهن', "category": 'سنگ', "rarity": 'Epic', "price": 613, "xp": 40, "tradeable": True},
+    {"name": 'مروارید کهن', "category": 'سنگ', "rarity": 'Epic', "price": 504, "xp": 33, "tradeable": True},
+    {"name": 'الماس یخی', "category": 'سنگ', "rarity": 'Uncommon', "price": 99, "xp": 6, "tradeable": True},
+    {"name": 'یاقوت یخی', "category": 'سنگ', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'زمرد یخی', "category": 'سنگ', "rarity": 'Rare', "price": 221, "xp": 14, "tradeable": True},
+    {"name": 'یاقوت\u200cکبود یخی', "category": 'سنگ', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'فیروزه یخی', "category": 'سنگ', "rarity": 'Uncommon', "price": 168, "xp": 11, "tradeable": True},
+    {"name": 'کهربا یخی', "category": 'سنگ', "rarity": 'Mythic', "price": 1901, "xp": 126, "tradeable": True},
+    {"name": 'عقیق یخی', "category": 'سنگ', "rarity": 'Uncommon', "price": 196, "xp": 13, "tradeable": True},
+    {"name": 'مروارید یخی', "category": 'سنگ', "rarity": 'Epic', "price": 694, "xp": 46, "tradeable": True},
+    {"name": 'شمشیر طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 222, "xp": 14, "tradeable": True},
+    {"name": 'کمان طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 477, "xp": 31, "tradeable": True},
+    {"name": 'خنجر طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 60, "xp": 4, "tradeable": True},
+    {"name": 'تبر طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 693, "xp": 46, "tradeable": True},
+    {"name": 'نیزه طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 210, "xp": 14, "tradeable": True},
+    {"name": 'گرز طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 45, "xp": 3, "tradeable": True},
+    {"name": 'سپر طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Legendary', "price": 1321, "xp": 88, "tradeable": True},
+    {"name": 'چماق طلاکاری\u200cشده', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'شمشیر جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'کمان جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 83, "xp": 5, "tradeable": True},
+    {"name": 'خنجر جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'تبر جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 217, "xp": 14, "tradeable": True},
+    {"name": 'نیزه جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'گرز جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 105, "xp": 7, "tradeable": True},
+    {"name": 'سپر جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'چماق جواهرنشان', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 207, "xp": 13, "tradeable": True},
+    {"name": 'شمشیر کهن', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 29, "xp": 1, "tradeable": True},
+    {"name": 'کمان کهن', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 359, "xp": 23, "tradeable": True},
+    {"name": 'خنجر کهن', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 94, "xp": 6, "tradeable": True},
+    {"name": 'تبر کهن', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 881, "xp": 58, "tradeable": True},
+    {"name": 'نیزه کهن', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 52, "xp": 3, "tradeable": True},
+    {"name": 'گرز کهن', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 130, "xp": 8, "tradeable": True},
+    {"name": 'سپر کهن', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 430, "xp": 28, "tradeable": True},
+    {"name": 'چماق کهن', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'شمشیر افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 128, "xp": 8, "tradeable": True},
+    {"name": 'کمان افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 96, "xp": 6, "tradeable": True},
+    {"name": 'خنجر افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 214, "xp": 14, "tradeable": True},
+    {"name": 'تبر افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 249, "xp": 16, "tradeable": True},
+    {"name": 'نیزه افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 181, "xp": 12, "tradeable": True},
+    {"name": 'گرز افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 69, "xp": 4, "tradeable": True},
+    {"name": 'سپر افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 124, "xp": 8, "tradeable": True},
+    {"name": 'چماق افسانه\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 64, "xp": 4, "tradeable": True},
+    {"name": 'شمشیر نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 730, "xp": 48, "tradeable": True},
+    {"name": 'کمان نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 37, "xp": 2, "tradeable": True},
+    {"name": 'خنجر نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 112, "xp": 7, "tradeable": True},
+    {"name": 'تبر نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'نیزه نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 634, "xp": 42, "tradeable": True},
+    {"name": 'گرز نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 65, "xp": 4, "tradeable": True},
+    {"name": 'سپر نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 164, "xp": 10, "tradeable": True},
+    {"name": 'چماق نقره\u200cای', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'شمشیر زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 87, "xp": 5, "tradeable": True},
+    {"name": 'کمان زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 191, "xp": 12, "tradeable": True},
+    {"name": 'خنجر زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 346, "xp": 23, "tradeable": True},
+    {"name": 'تبر زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 153, "xp": 10, "tradeable": True},
+    {"name": 'نیزه زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 82, "xp": 5, "tradeable": True},
+    {"name": 'گرز زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 383, "xp": 25, "tradeable": True},
+    {"name": 'سپر زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 167, "xp": 11, "tradeable": True},
+    {"name": 'چماق زنگارگرفته', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'شمشیر درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 918, "xp": 61, "tradeable": True},
+    {"name": 'کمان درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'خنجر درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 309, "xp": 20, "tradeable": True},
+    {"name": 'تبر درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 170, "xp": 11, "tradeable": True},
+    {"name": 'نیزه درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 354, "xp": 23, "tradeable": True},
+    {"name": 'گرز درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Rare', "price": 276, "xp": 18, "tradeable": True},
+    {"name": 'سپر درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 232, "xp": 15, "tradeable": True},
+    {"name": 'چماق درخشان', "category": 'اسلحه_تزئینی', "rarity": 'Legendary', "price": 1726, "xp": 115, "tradeable": True},
+    {"name": 'شمشیر مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Epic', "price": 341, "xp": 22, "tradeable": True},
+    {"name": 'کمان مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 115, "xp": 7, "tradeable": True},
+    {"name": 'خنجر مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'تبر مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 195, "xp": 13, "tradeable": True},
+    {"name": 'نیزه مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'گرز مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Uncommon', "price": 190, "xp": 12, "tradeable": True},
+    {"name": 'سپر مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'چماق مرموز', "category": 'اسلحه_تزئینی', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'ردا شاهانه', "category": 'لباس', "rarity": 'Uncommon', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'کلاه شاهانه', "category": 'لباس', "rarity": 'Rare', "price": 338, "xp": 22, "tradeable": True},
+    {"name": 'چکمه شاهانه', "category": 'لباس', "rarity": 'Uncommon', "price": 224, "xp": 14, "tradeable": True},
+    {"name": 'دستکش شاهانه', "category": 'لباس', "rarity": 'Common', "price": 43, "xp": 2, "tradeable": True},
+    {"name": 'شنل شاهانه', "category": 'لباس', "rarity": 'Epic', "price": 622, "xp": 41, "tradeable": True},
+    {"name": 'زره شاهانه', "category": 'لباس', "rarity": 'Uncommon', "price": 208, "xp": 13, "tradeable": True},
+    {"name": 'کمربند شاهانه', "category": 'لباس', "rarity": 'Common', "price": 74, "xp": 4, "tradeable": True},
+    {"name": 'روسری شاهانه', "category": 'لباس', "rarity": 'Rare', "price": 185, "xp": 12, "tradeable": True},
+    {"name": 'ردا جادویی', "category": 'لباس', "rarity": 'Common', "price": 71, "xp": 4, "tradeable": True},
+    {"name": 'کلاه جادویی', "category": 'لباس', "rarity": 'Common', "price": 35, "xp": 2, "tradeable": True},
+    {"name": 'چکمه جادویی', "category": 'لباس', "rarity": 'Common', "price": 56, "xp": 3, "tradeable": True},
+    {"name": 'دستکش جادویی', "category": 'لباس', "rarity": 'Rare', "price": 279, "xp": 18, "tradeable": True},
+    {"name": 'شنل جادویی', "category": 'لباس', "rarity": 'Uncommon', "price": 92, "xp": 6, "tradeable": True},
+    {"name": 'زره جادویی', "category": 'لباس', "rarity": 'Epic', "price": 469, "xp": 31, "tradeable": True},
+    {"name": 'کمربند جادویی', "category": 'لباس', "rarity": 'Rare', "price": 249, "xp": 16, "tradeable": True},
+    {"name": 'روسری جادویی', "category": 'لباس', "rarity": 'Uncommon', "price": 106, "xp": 7, "tradeable": True},
+    {"name": 'ردا کهنه', "category": 'لباس', "rarity": 'Uncommon', "price": 163, "xp": 10, "tradeable": True},
+    {"name": 'کلاه کهنه', "category": 'لباس', "rarity": 'Uncommon', "price": 226, "xp": 15, "tradeable": True},
+    {"name": 'چکمه کهنه', "category": 'لباس', "rarity": 'Uncommon', "price": 207, "xp": 13, "tradeable": True},
+    {"name": 'دستکش کهنه', "category": 'لباس', "rarity": 'Uncommon', "price": 226, "xp": 15, "tradeable": True},
+    {"name": 'شنل کهنه', "category": 'لباس', "rarity": 'Legendary', "price": 908, "xp": 60, "tradeable": True},
+    {"name": 'زره کهنه', "category": 'لباس', "rarity": 'Common', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'کمربند کهنه', "category": 'لباس', "rarity": 'Uncommon', "price": 149, "xp": 9, "tradeable": True},
+    {"name": 'روسری کهنه', "category": 'لباس', "rarity": 'Common', "price": 57, "xp": 3, "tradeable": True},
+    {"name": 'ردا رزمی', "category": 'لباس', "rarity": 'Mythic', "price": 2063, "xp": 137, "tradeable": True},
+    {"name": 'کلاه رزمی', "category": 'لباس', "rarity": 'Common', "price": 90, "xp": 6, "tradeable": True},
+    {"name": 'چکمه رزمی', "category": 'لباس', "rarity": 'Epic', "price": 721, "xp": 48, "tradeable": True},
+    {"name": 'دستکش رزمی', "category": 'لباس', "rarity": 'Rare', "price": 323, "xp": 21, "tradeable": True},
+    {"name": 'شنل رزمی', "category": 'لباس', "rarity": 'Legendary', "price": 769, "xp": 51, "tradeable": True},
+    {"name": 'زره رزمی', "category": 'لباس', "rarity": 'Uncommon', "price": 153, "xp": 10, "tradeable": True},
+    {"name": 'کمربند رزمی', "category": 'لباس', "rarity": 'Legendary', "price": 890, "xp": 59, "tradeable": True},
+    {"name": 'روسری رزمی', "category": 'لباس', "rarity": 'Uncommon', "price": 109, "xp": 7, "tradeable": True},
+    {"name": 'ردا مخملی', "category": 'لباس', "rarity": 'Rare', "price": 328, "xp": 21, "tradeable": True},
+    {"name": 'کلاه مخملی', "category": 'لباس', "rarity": 'Rare', "price": 397, "xp": 26, "tradeable": True},
+    {"name": 'چکمه مخملی', "category": 'لباس', "rarity": 'Legendary', "price": 1415, "xp": 94, "tradeable": True},
+    {"name": 'دستکش مخملی', "category": 'لباس', "rarity": 'Epic', "price": 739, "xp": 49, "tradeable": True},
+    {"name": 'شنل مخملی', "category": 'لباس', "rarity": 'Epic', "price": 263, "xp": 17, "tradeable": True},
+    {"name": 'زره مخملی', "category": 'لباس', "rarity": 'Common', "price": 39, "xp": 2, "tradeable": True},
+    {"name": 'کمربند مخملی', "category": 'لباس', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'روسری مخملی', "category": 'لباس', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'ردا سفری', "category": 'لباس', "rarity": 'Common', "price": 42, "xp": 2, "tradeable": True},
+    {"name": 'کلاه سفری', "category": 'لباس', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'چکمه سفری', "category": 'لباس', "rarity": 'Epic', "price": 381, "xp": 25, "tradeable": True},
+    {"name": 'دستکش سفری', "category": 'لباس', "rarity": 'Rare', "price": 271, "xp": 18, "tradeable": True},
+    {"name": 'شنل سفری', "category": 'لباس', "rarity": 'Uncommon', "price": 126, "xp": 8, "tradeable": True},
+    {"name": 'زره سفری', "category": 'لباس', "rarity": 'Rare', "price": 302, "xp": 20, "tradeable": True},
+    {"name": 'کمربند سفری', "category": 'لباس', "rarity": 'Common', "price": 77, "xp": 5, "tradeable": True},
+    {"name": 'روسری سفری', "category": 'لباس', "rarity": 'Legendary', "price": 1347, "xp": 89, "tradeable": True},
+    {"name": 'ردا تشریفاتی', "category": 'لباس', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'کلاه تشریفاتی', "category": 'لباس', "rarity": 'Epic', "price": 835, "xp": 55, "tradeable": True},
+    {"name": 'چکمه تشریفاتی', "category": 'لباس', "rarity": 'Legendary', "price": 1360, "xp": 90, "tradeable": True},
+    {"name": 'دستکش تشریفاتی', "category": 'لباس', "rarity": 'Uncommon', "price": 130, "xp": 8, "tradeable": True},
+    {"name": 'شنل تشریفاتی', "category": 'لباس', "rarity": 'Mythic', "price": 2059, "xp": 137, "tradeable": True},
+    {"name": 'زره تشریفاتی', "category": 'لباس', "rarity": 'Mythic', "price": 1045, "xp": 69, "tradeable": True},
+    {"name": 'کمربند تشریفاتی', "category": 'لباس', "rarity": 'Common', "price": 81, "xp": 5, "tradeable": True},
+    {"name": 'روسری تشریفاتی', "category": 'لباس', "rarity": 'Common', "price": 70, "xp": 4, "tradeable": True},
+    {"name": 'ردا مرموز', "category": 'لباس', "rarity": 'Common', "price": 49, "xp": 3, "tradeable": True},
+    {"name": 'کلاه مرموز', "category": 'لباس', "rarity": 'Uncommon', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'چکمه مرموز', "category": 'لباس', "rarity": 'Legendary', "price": 640, "xp": 42, "tradeable": True},
+    {"name": 'دستکش مرموز', "category": 'لباس', "rarity": 'Uncommon', "price": 142, "xp": 9, "tradeable": True},
+    {"name": 'شنل مرموز', "category": 'لباس', "rarity": 'Uncommon', "price": 125, "xp": 8, "tradeable": True},
+    {"name": 'زره مرموز', "category": 'لباس', "rarity": 'Rare', "price": 353, "xp": 23, "tradeable": True},
+    {"name": 'کمربند مرموز', "category": 'لباس', "rarity": 'Common', "price": 45, "xp": 3, "tradeable": True},
+    {"name": 'روسری مرموز', "category": 'لباس', "rarity": 'Common', "price": 105, "xp": 7, "tradeable": True},
+    {"name": 'کالسکه اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 72, "xp": 4, "tradeable": True},
+    {"name": 'موتور جنگی اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 282, "xp": 18, "tradeable": True},
+    {"name": 'کشتی بادبانی اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 100, "xp": 6, "tradeable": True},
+    {"name": 'بالون هوایی اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 53, "xp": 3, "tradeable": True},
+    {"name": 'گاری اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 75, "xp": 5, "tradeable": True},
+    {"name": 'قایق اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 156, "xp": 10, "tradeable": True},
+    {"name": 'سورتمه اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 281, "xp": 18, "tradeable": True},
+    {"name": 'ارابه اسپرت', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 174, "xp": 11, "tradeable": True},
+    {"name": 'کالسکه سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 107, "xp": 7, "tradeable": True},
+    {"name": 'موتور جنگی سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 162, "xp": 10, "tradeable": True},
+    {"name": 'کشتی بادبانی سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 151, "xp": 10, "tradeable": True},
+    {"name": 'بالون هوایی سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Epic', "price": 414, "xp": 27, "tradeable": True},
+    {"name": 'گاری سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 37, "xp": 2, "tradeable": True},
+    {"name": 'قایق سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 1567, "xp": 104, "tradeable": True},
+    {"name": 'سورتمه سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 127, "xp": 8, "tradeable": True},
+    {"name": 'ارابه سلطنتی', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 409, "xp": 27, "tradeable": True},
+    {"name": 'کالسکه زرهی', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 95, "xp": 6, "tradeable": True},
+    {"name": 'موتور جنگی زرهی', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 596, "xp": 39, "tradeable": True},
+    {"name": 'کشتی بادبانی زرهی', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 114, "xp": 7, "tradeable": True},
+    {"name": 'بالون هوایی زرهی', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 66, "xp": 4, "tradeable": True},
+    {"name": 'گاری زرهی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 148, "xp": 9, "tradeable": True},
+    {"name": 'قایق زرهی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 194, "xp": 12, "tradeable": True},
+    {"name": 'سورتمه زرهی', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'ارابه زرهی', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 33, "xp": 2, "tradeable": True},
+    {"name": 'کالسکه کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'موتور جنگی کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 80, "xp": 5, "tradeable": True},
+    {"name": 'کشتی بادبانی کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 300, "xp": 20, "tradeable": True},
+    {"name": 'بالون هوایی کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'گاری کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Epic', "price": 273, "xp": 18, "tradeable": True},
+    {"name": 'قایق کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 110, "xp": 7, "tradeable": True},
+    {"name": 'سورتمه کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 375, "xp": 25, "tradeable": True},
+    {"name": 'ارابه کلاسیک', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 154, "xp": 10, "tradeable": True},
+    {"name": 'کالسکه سریع', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 1476, "xp": 98, "tradeable": True},
+    {"name": 'موتور جنگی سریع', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 41, "xp": 2, "tradeable": True},
+    {"name": 'کشتی بادبانی سریع', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 85, "xp": 5, "tradeable": True},
+    {"name": 'بالون هوایی سریع', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 936, "xp": 62, "tradeable": True},
+    {"name": 'گاری سریع', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 268, "xp": 17, "tradeable": True},
+    {"name": 'قایق سریع', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 1241, "xp": 82, "tradeable": True},
+    {"name": 'سورتمه سریع', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 55, "xp": 3, "tradeable": True},
+    {"name": 'ارابه سریع', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 44, "xp": 2, "tradeable": True},
+    {"name": 'کالسکه کهنه', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 1545, "xp": 103, "tradeable": True},
+    {"name": 'موتور جنگی کهنه', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 152, "xp": 10, "tradeable": True},
+    {"name": 'کشتی بادبانی کهنه', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 63, "xp": 4, "tradeable": True},
+    {"name": 'بالون هوایی کهنه', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 140, "xp": 9, "tradeable": True},
+    {"name": 'گاری کهنه', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 204, "xp": 13, "tradeable": True},
+    {"name": 'قایق کهنه', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 103, "xp": 6, "tradeable": True},
+    {"name": 'سورتمه کهنه', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'ارابه کهنه', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 91, "xp": 6, "tradeable": True},
+    {"name": 'کالسکه براق', "category": 'وسیله_نقلیه', "rarity": 'Legendary', "price": 613, "xp": 40, "tradeable": True},
+    {"name": 'موتور جنگی براق', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 67, "xp": 4, "tradeable": True},
+    {"name": 'کشتی بادبانی براق', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 158, "xp": 10, "tradeable": True},
+    {"name": 'بالون هوایی براق', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 89, "xp": 5, "tradeable": True},
+    {"name": 'گاری براق', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 178, "xp": 11, "tradeable": True},
+    {"name": 'قایق براق', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 76, "xp": 5, "tradeable": True},
+    {"name": 'سورتمه براق', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 159, "xp": 10, "tradeable": True},
+    {"name": 'ارابه براق', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 88, "xp": 5, "tradeable": True},
+    {"name": 'کالسکه افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 181, "xp": 12, "tradeable": True},
+    {"name": 'موتور جنگی افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Epic', "price": 839, "xp": 55, "tradeable": True},
+    {"name": 'کشتی بادبانی افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Epic', "price": 767, "xp": 51, "tradeable": True},
+    {"name": 'بالون هوایی افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Common', "price": 36, "xp": 2, "tradeable": True},
+    {"name": 'گاری افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 205, "xp": 13, "tradeable": True},
+    {"name": 'قایق افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Rare', "price": 302, "xp": 20, "tradeable": True},
+    {"name": 'سورتمه افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Epic', "price": 464, "xp": 30, "tradeable": True},
+    {"name": 'ارابه افسانه\u200cای', "category": 'وسیله_نقلیه', "rarity": 'Uncommon', "price": 81, "xp": 5, "tradeable": True},
+]
+
+ITEM_CATALOG_BY_NAME = {item['name']: item for item in ITEM_CATALOG}
+ITEM_CATALOG_BY_NAME[OG_ITEM['name']] = OG_ITEM
 
 
 # ==============================================================================
@@ -1383,56 +3064,79 @@ async def send_start(reply):
 
 async def send_help(reply):
     mood_list = "، ".join(MOOD_NAMES)
-    await reply(f"""🫡 لیست کامل قابلیت‌های {BOT_BRAND} 👇
+    await reply(f"""🫡 راهنمای کامل {BOT_BRAND} 👇 (برای بخش‌های بیشتر «قابلیت ها ۲» رو بزن)
 
+━━━━━━━━━━━━━━━
 💬 عمومی
-سلام / خوبی / جوک / شانس / فال / تاس / چالش
-تاریخ (شمسی+میلادی) | ساعت
+━━━━━━━━━━━━━━━
+سلام / خوبی / جوک / شانس / فال / تاس / چالش / معما
+تاریخ | ساعت | مالک ربات | پیام به ادمین [متن]
+مود [اسم] — گزینه‌ها: {mood_list}
 
-🎭 مود ({len(MOOD_NAMES)} حالت)
-بنویس «مود [اسم]» — گزینه‌ها: {mood_list}
+━━━━━━━━━━━━━━━
+👤 پروفایل و تنظیمات
+━━━━━━━━━━━━━━━
+پروفایل | آمار | دستاوردها
+تنظیم اسم/ایموجی/لقب/اصل [متن]
 
-👤 پروفایل و آمار
-پروفایل | آمار | رتبه
-تنظیم اسم [نام] | تنظیم ایموجی [شکلک] | تنظیم لقب [متن] | تنظیم اصل [متن]
-
+━━━━━━━━━━━━━━━
 💰 اقتصاد
-جایزه روزانه | فروشگاه | خرید [آیتم] | شکار | شرط [مبلغ] (ریسک بالا!)
+━━━━━━━━━━━━━━━
+جایزه روزانه | شکار | شرط [مبلغ] (ریسک بالا!)
+فروشگاه | خرید [آیتم]
+(ریپلای) هدیه سکه/ایکس پی [مقدار] | هدیه آیتم [اسم]
 
+━━━━━━━━━━━━━━━
+🎒 کلکسیون و اسپاون
+━━━━━━━━━━━━━━━
+هر ۳۰ دقیقه یه آیتم کمیاب (از Common تا OG یکتا) اسپون میشه!
+وضعیت اسپاون | بگیرش (تو ۳۰ ثانیه اول)
+
+━━━━━━━━━━━━━━━
+🖤 بازار سیاه
+━━━━━━━━━━━━━━━
+بازار [فیلتر] | خرید بازار [شماره]
+فروش [آیتم] [قیمت] | لغو آگهی [شماره]
+مزایده [آیتم] [قیمت پایه] [دقیقه] (فقط Epic+) | پیشنهاد [شماره] [مبلغ]
+تاریخچه معاملات
+
+━━━━━━━━━━━━━━━
 🎮 بازی‌ها
-حدس عدد | دوز | مسابقه | معما
-⚽ پنالتی | فروشگاه پنالتی | خرید پنالتی [آیتم]
-🔫 رولت روسی [مبلغ] | فروشگاه رولت | خرید رولت [آیتم]
-🚔 فرار از زندان (داستان شاخه‌ای)
-🎭 جرعت حقیقت | 🕵️ دروغ سنج
+━━━━━━━━━━━━━━━
+حدس عدد | دوز | مسابقه
+⚽ پنالتی [چپ/وسط/راست] | فروشگاه پنالتی
+🔫 رولت روسی [مبلغ] (شانس برد فقط ۱٪!)
+🚔 فرار از زندان | 🎭 جرعت حقیقت | 🕵️ دروغ سنج
+🗺️ شکار گنج | 🔐 گاوصندوق | 🚔 دزد و پلیس
+⚔️ دوئل [مبلغ] (با ریپلای)
 
-🎉 موقع پارتی (فقط وقتی ادمین «شروع ادمین ابیوز» بزنه)
+━━━━━━━━━━━━━━━
+🎉 موقع پارتی («ادمین ابیوز»)
+━━━━━━━━━━━━━━━
 چرخ شانس | جعبه شانس | دوز غول | وضعیت پارتی
+⚔️ حمله (نبرد رئیس) | وضعیت رئیس
 
-📂 گروه‌ها (فقط داخل گروه)
-آمار گروه | آمار اعضا | لیست قفل‌ها | لیست ادمین‌ها
+━━━━━━━━━━━━━━━
+🛡️ کلن/گیلد و لیدربورد
+━━━━━━━━━━━━━━━
+کلن بساز [اسم] | عضویت در کلن [اسم] | خروج از کلن | کلن‌ها | کلن من
+رتبه (XP) | رتبه سکه | رتبه برد | رتبه آیتم
 
-🛡️ مدیریت گروه (ادمین گروه یا مالک)
-فعال (ثبت گروه)
-(ریپلای) + «ادمین» / «حذف کن» / «سکوت» / «رفع سکوت»
-(ریپلای) + «انتقال مالکیت ربات» — مالکیت گروه رو به اون فرد می‌ده
-قفل [لینک/اسپم/منشن/فوروارد/الفاظ نامناسب]
-باز کردن قفل [همون‌ها]
+━━━━━━━━━━━━━━━
+📂 گروه (فقط داخل گروه)
+━━━━━━━━━━━━━━━
+آمار گروه | لیست قفل‌ها | لیست ادمین‌ها | فعال
+(ریپلای) ادمین/حذف کن/سکوت/رفع سکوت/انتقال مالکیت ربات
+قفل [نوع] | باز کردن قفل [نوع]
 
+━━━━━━━━━━━━━━━
 👑 فقط ادمین اصلی ربات
+━━━━━━━━━━━━━━━
 همگانی [متن] | آمار کلی ربات
-(ریپلای یا با آیدی) «اضافه کردن سکه [مقدار]» / «کم کردن سکه [مقدار]» / «ریست کاربر»
-(ریپلای یا با آیدی) «اضافه کردن ایکس پی [مقدار]» / «کم کردن ایکس پی [مقدار]»
-شروع سکه پارتی [مقدار] [مدت] [ضریب] | شروع ایکس پی پارتی [مقدار] [مدت] [ضریب]
-شروع ادمین ابیوز [مدت] [ضریب] — فقط جشن+ضریب، بدون بونوس (پیش‌فرض: ۲ دقیقه ×۲)
-توقف پارتی
-مثال بدون ریپلای: اضافه کردن سکه 500 u0Hx... (آیدی رو بذار)
+(ریپلای/آیدی) اضافه‌کردن سکه/ایکس‌پی [مقدار] | کم‌کردن سکه/ایکس‌پی [مقدار] | ریست کاربر
+شروع سکه/ایکس‌پی پارتی [مقدار] [مدت] [ضریب] | شروع ادمین ابیوز [مدت] [ضریب] | توقف پارتی
 
-📛 صدام کن
-بنویس «{BOT_NAME_TRIGGER}» یا «وانتا» هرجای پیامت، جواب می‌دم
-
-📩 تماس با ادمین
-پیام به ادمین [متنت] — مستقیم برای سازنده‌ی ربات می‌فرسته""")
+📛 صدام کن با «{BOT_NAME_TRIGGER}» یا «وانتا» هرجای پیامت""")
 
 
 async def handle_mood_set(reply, uid, text_raw):
@@ -1918,14 +3622,23 @@ async def _run_party_background(bot, duration_minutes, multiplier):
     total_seconds = duration_minutes * 60
 
     # پیام‌های هیجانی شروع پارتی
-    for msg in PARTY_HYPE_MESSAGES[:3]:
+    for msg in random.sample(PARTY_HYPE_MESSAGES, min(3, len(PARTY_HYPE_MESSAGES))):
         await _party_broadcast_all(bot, msg)
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
+
+    await _party_broadcast_all(bot, random.choice(PARTY_BEAT_DROP))
+    await asyncio.sleep(3)
+
+    boss_name = get_state("boss_name", "یه هیولای وحشتناک 👹")
+    await _party_broadcast_all(
+        bot,
+        f"👹 یه رئیس ظاهر شد: {boss_name}\nهمه بریزید تو پیوی ربات و بنویسید «حمله» تا شکستش بدیم!"
+    )
 
     await _party_broadcast_all(
         bot,
-        f"🎮 موقع پارتیه، این بازیای ویژه رو امتحان کن:\n"
-        f"🎡 «چرخ شانس» | 📦 «جعبه شانس» | 👑 «دوز غول»\n"
+        f"🎮 بازیای ویژه‌ی پارتی:\n"
+        f"🎡 «چرخ شانس» | 📦 «جعبه شانس» | 👑 «دوز غول» | ⚔️ «حمله» (نبرد رئیس)\n"
         f"همشون فقط الان فعالن و جایزه‌ی خیلی بیشتری می‌دن!"
     )
 
@@ -1938,13 +3651,15 @@ async def _run_party_background(bot, duration_minutes, multiplier):
         if remaining_min > 0:
             dance = random.choice(PARTY_DANCE_EMOJIS)
             hype = random.choice(PARTY_HYPE_MESSAGES)
+            extra = random.choice([random.choice(PARTY_BEAT_DROP), "⚔️ رئیس هنوز منتظرته، برو بهش حمله کن!"])
             await _party_broadcast_all(
                 bot,
                 f"{dance} {hype}\n"
-                f"⚡ سکه/XP همچنان ×{multiplier:g}ـه! ⏳ حدود {remaining_min} دقیقه‌ی دیگه مونده."
+                f"⚡ سکه/XP همچنان ×{multiplier:g}ـه! ⏳ حدود {remaining_min} دقیقه‌ی دیگه مونده.\n\n{extra}"
             )
 
     set_state("party_expires_ts", "0")
+    set_state("boss_hp", "0")
     await _party_broadcast_all(bot, "🥳 پارتی تموم شد! ممنون که بودید، منتظر پارتی بعدی باشید 💜")
 
 
@@ -1955,7 +3670,11 @@ async def handle_party_status(reply):
     expires = float(get_state("party_expires_ts", "0"))
     remaining_min = max(0, round((expires - time.time()) / 60))
     multiplier = get_active_multiplier()
-    await reply(f"🎉 پارتی فعاله!\n⚡ ضریب سکه/XP: ×{multiplier:g}\n⏳ حدود {remaining_min} دقیقه مونده\n\n🎮 بازیای ویژه: چرخ شانس | جعبه شانس | دوز غول")
+    boss_name = get_state("boss_name", "-")
+    boss_hp = get_state("boss_hp", "0")
+    await reply(f"🎉 پارتی فعاله!\n⚡ ضریب سکه/XP: ×{multiplier:g}\n⏳ حدود {remaining_min} دقیقه مونده\n"
+                f"👹 رئیس فعلی: {boss_name} ({boss_hp} HP)\n\n"
+                f"🎮 بازیای ویژه: چرخ شانس | جعبه شانس | دوز غول | حمله (نبرد رئیس)")
 
 
 def _parse_party_numbers(text_raw):
@@ -2037,6 +3756,18 @@ def _activate_party_state(duration_min, multiplier):
     expires_at = time.time() + duration_min * 60
     set_state("party_expires_ts", expires_at)
     set_state("party_multiplier", multiplier)
+    _spawn_party_boss(multiplier)
+
+
+def _spawn_party_boss(multiplier):
+    """رئیس اول پارتی رو می‌سازه؛ باقی رئیس‌ها خودکار بعد از شکست قبلی‌
+    تو py ساخته می‌شن."""
+    name = random.choice(BOSS_NAMES)
+    hp = int(BOSS_HP_BASE * max(1, multiplier * 0.6))
+    set_state("boss_name", name)
+    set_state("boss_hp", hp)
+    set_state("boss_max_hp", hp)
+    return name, hp
 
 
 def _launch_party_task(bot, duration_min, multiplier):
@@ -2300,7 +4031,7 @@ async def handle_bot_wide_stats(reply, uid):
 
 
 # ==============================================================================
-# بخش ۱۰: بازی‌ها (شامل بازی‌های مخصوص پارتی)
+# بخش ۱۰: بازی‌ها
 # ==============================================================================
 # =============================================================================
 # حالت‌های فعال (per uid) - همه تو حافظه
@@ -2460,7 +4191,7 @@ async def handle_buy_penalty_item(reply, uid, u, text_raw):
 async def handle_roulette(reply, uid, u, text_raw):
     bet_str = "".join(ch for ch in text_raw if ch.isdigit())
     if not bet_str:
-        await reply("بنویس: «رولت روسی [مبلغ شرط]» — مثلا: رولت روسی 200")
+        await reply("بنویس: «رولت روسی [مبلغ شرط]» — مثلا: رولت روسی 200\n⚠️ شانس برد فقط ۱٪ ئه، خیلی خیلی سخته!")
         return
     bet = int(bet_str)
     if bet <= 0:
@@ -2470,20 +4201,23 @@ async def handle_roulette(reply, uid, u, text_raw):
         await reply("❌ سکه‌ت برای این شرط کافی نیست.")
         return
 
+    # بالانس شده: شانس برد فقط ۱٪، آیتم‌ها کمی کمکت می‌کنن ولی سقف داره
+    # (که همچنان خیلی سخت بمونه و راهی برای پولدار شدن سریع نباشه)
     owned = {i["item_name"] for i in get_items(uid, "roulette")}
-    death_chance = 1 / 6
+    win_chance = 0.01
     if "خشاب شانس" in owned:
-        death_chance = 1 / 8
+        win_chance += 0.005
     if "طلسم بقا" in owned:
-        death_chance *= 0.5
+        win_chance += 0.005
+    win_chance = min(win_chance, 0.03)  # سقف ۳٪، حتی با همه‌ی آیتم‌ها
 
-    if random.random() < death_chance:
-        remove_coins(uid, bet)
-        await reply(f"🔫💥 بنـــگ! امروز شانس باهات نبود.\n💸 {bet:,} سکه رو باختی.")
-    else:
+    if random.random() < win_chance:
         add_coins(uid, bet)
         add_xp(uid, 8)
-        await reply(f"🔫😮‍💨 تیک... خالی بود! زنده موندی.\n💰 {bet:,} سکه بردی! (مجموع: {bet*2:,})")
+        await reply(f"🔫✨ باورنکردنیه!! بردی!\n💰 {bet:,} سکه بردی! (مجموع: {bet*2:,})")
+    else:
+        remove_coins(uid, bet)
+        await reply(f"🔫💥 بنـــگ! باختی (شانس برد فقط ۱٪ بود).\n💸 {bet:,} سکه رو از دست دادی.")
 
 
 async def handle_roulette_shop(reply):
@@ -2657,6 +4391,98 @@ async def _finish_tictactoe(reply, uid, winner, board):
         await reply(f"{board_txt}\n\n😅 این‌بار من بردم، دوباره امتحان کن.")
     else:
         await reply(f"{board_txt}\n\n🤝 مساوی شد!")
+
+
+# =============================================================================
+# 👹 نبرد رئیس (Boss Battle) - فقط موقع پارتی، همه با هم حمله می‌کنن
+# =============================================================================
+_boss_damage_contrib = {}  # {uid: مجموع دمیجی که زده}
+
+
+def spawn_boss(multiplier=1):
+    name = random.choice(BOSS_NAMES)
+    hp = int(BOSS_HP_BASE * max(1, multiplier * 0.6))  # با ضریب پارتی، باس هم قوی‌تر میشه
+    set_state("boss_name", name)
+    set_state("boss_hp", hp)
+    set_state("boss_max_hp", hp)
+    _boss_damage_contrib.clear()
+    return name, hp
+
+
+def get_boss_status():
+    name = get_state("boss_name")
+    if not name:
+        return None
+    hp = int(float(get_state("boss_hp", "0")))
+    max_hp = int(float(get_state("boss_max_hp", "1")))
+    return {"name": name, "hp": hp, "max_hp": max_hp}
+
+
+def _hp_bar(hp, max_hp, length=10):
+    filled = max(0, min(length, round((hp / max_hp) * length))) if max_hp else 0
+    return "🟥" * filled + "⬛" * (length - filled)
+
+
+async def handle_attack(reply, uid):
+    if not is_party_active():
+        await reply("👹 هیچ رئیسی الان نیست! فقط موقع پارتی نبرد رئیس فعاله.")
+        return
+
+    boss = get_boss_status()
+    if not boss or boss["hp"] <= 0:
+        await reply("👹 الان رئیسی برای حمله نیست.")
+        return
+
+    dmg = random.randint(BOSS_ATTACK_MIN, BOSS_ATTACK_MAX)
+    new_hp = max(0, boss["hp"] - dmg)
+    set_state("boss_hp", new_hp)
+    _boss_damage_contrib[uid] = _boss_damage_contrib.get(uid, 0) + dmg
+    attack_line = random.choice(BOSS_ATTACK_MESSAGES)
+
+    if new_hp <= 0:
+        await reply(f"{attack_line} 💥 {dmg} دمیج زدی!\n\n👑 {boss['name']} نابود شد!!")
+        await _resolve_boss_defeat(reply, boss)
+        return
+
+    bar = _hp_bar(new_hp, boss["max_hp"])
+    await reply(f"{attack_line} 💥 {dmg} دمیج زدی!\n{boss['name']}\n{bar}  {new_hp:,}/{boss['max_hp']:,} HP")
+
+
+async def _resolve_boss_defeat(reply, boss):
+    multiplier = get_active_multiplier()
+
+    if not _boss_damage_contrib:
+        return
+
+    total_dmg = sum(_boss_damage_contrib.values())
+    top_uid = max(_boss_damage_contrib, key=_boss_damage_contrib.get)
+
+    lines = ["🏆 نتیجه‌ی نبرد:"]
+    for u_id, dmg in sorted(_boss_damage_contrib.items(), key=lambda x: -x[1]):
+        share = dmg / total_dmg
+        coins = int(1500 * share * multiplier)
+        xp = int(150 * share * multiplier)
+        add_coins(u_id, coins)
+        add_xp(u_id, xp)
+        tag = " 👑 (بیشترین دمیج!)" if u_id == top_uid else ""
+        lines.append(f"• {u_id[-6:]}: {dmg:,} دمیج → 💰{coins:,} | ✨{xp}{tag}")
+
+    await reply("\n".join(lines))
+    # یه رئیس جدید بلافاصله ظاهر میشه تا نبرد ادامه پیدا کنه
+    new_name, new_hp = spawn_boss(multiplier)
+    await reply(f"👹 یه رئیس جدید ظاهر شد: {new_name}\n{_hp_bar(new_hp, new_hp)}  {new_hp:,}/{new_hp:,} HP\nبنویس «حمله» تا شروع کنی!")
+
+
+async def handle_boss_status(reply):
+    if not is_party_active():
+        await reply("👹 الان پارتی فعال نیست، رئیسی هم نیست.")
+        return
+    boss = get_boss_status()
+    if not boss:
+        await reply("👹 هنوز رئیسی ظاهر نشده.")
+        return
+    bar = _hp_bar(boss["hp"], boss["max_hp"])
+    await reply(f"👹 {boss['name']}\n{bar}  {boss['hp']:,}/{boss['max_hp']:,} HP\nبنویس «حمله» تا بهش ضربه بزنی!")
 
 
 # =============================================================================
@@ -2846,10 +4672,766 @@ async def handle_riddle(reply):
 
 
 # ==============================================================================
-# بخش ۱۱: روتر اصلی و اجرای ربات
+# بخش ۱۱: بازار سیاه و هدیه/انتقال
+# ==============================================================================
+MIN_AUCTION_RARITY_ORDER = ["Epic", "Legendary", "Mythic", "God", "Secret", "OG"]
+
+
+# =============================================================================
+# 🎁 هدیه / انتقال بین کاربران
+# =============================================================================
+async def handle_gift_coins(reply, uid, u, text_raw, reply_sender_uid):
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای بهش هدیه بدی ریپلای بزنی.")
+        return
+    if str(reply_sender_uid) == str(uid):
+        await reply("❌ نمی‌تونی به خودت هدیه بدی.")
+        return
+    amount = extract_amount(text_raw)
+    if not amount or amount <= 0:
+        await reply("بنویس: (ریپلای) «هدیه سکه [مقدار]»")
+        return
+    if u["coins"] < amount:
+        await reply("❌ سکه‌ت کافی نیست.")
+        return
+
+    remove_coins(uid, amount)
+    add_coins(reply_sender_uid, amount)
+    await reply(f"🎁 {amount:,} سکه به آیدی {reply_sender_uid} هدیه دادی!")
+
+
+async def handle_gift_xp(reply, uid, u, text_raw, reply_sender_uid):
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای بهش هدیه بدی ریپلای بزنی.")
+        return
+    if str(reply_sender_uid) == str(uid):
+        await reply("❌ نمی‌تونی به خودت هدیه بدی.")
+        return
+    amount = extract_amount(text_raw)
+    if not amount or amount <= 0:
+        await reply("بنویس: (ریپلای) «هدیه ایکس پی [مقدار]»")
+        return
+    if u["xp"] < amount:
+        await reply("❌ XP کافی نداری.")
+        return
+
+    update_user(uid, xp=u["xp"] - amount)
+    add_xp(reply_sender_uid, amount)
+    await reply(f"🎁 {amount:,} XP به آیدی {reply_sender_uid} هدیه دادی!")
+
+
+async def handle_gift_item(reply, uid, text_raw, reply_sender_uid):
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای بهش هدیه بدی ریپلای بزنی.")
+        return
+    if str(reply_sender_uid) == str(uid):
+        await reply("❌ نمی‌تونی به خودت هدیه بدی.")
+        return
+    item_name = text_raw.replace("هدیه آیتم", "", 1).strip()
+    if not item_name:
+        await reply("بنویس: (ریپلای) «هدیه آیتم [اسم آیتم]»")
+        return
+
+    owned = find_owned_item(uid, item_name)
+    if not owned:
+        await reply("❌ این آیتم رو نداری.")
+        return
+
+    removed = remove_item(uid, owned["category"], item_name, 1)
+    if not removed:
+        await reply("❌ موجودی کافی نداری.")
+        return
+    add_item(reply_sender_uid, owned["category"], item_name, 1)
+    await reply(f"🎁 «{item_name}» رو به آیدی {reply_sender_uid} هدیه دادی!")
+
+
+# =============================================================================
+# 🖤 بازار سیاه
+# =============================================================================
+def _get_item_rarity_info(item_name):
+    catalog_item = ITEM_CATALOG_BY_NAME.get(item_name)
+    return catalog_item["rarity"] if catalog_item else None
+
+
+async def handle_sell(reply, uid, text_raw):
+    """فروش [آیتم] [قیمت]"""
+    rest = text_raw.replace("فروش", "", 1).strip()
+    price = extract_amount(rest)
+    if not price or price <= 0:
+        await reply("بنویس: «فروش [اسم آیتم] [قیمت]»")
+        return
+    item_name = rest.rsplit(str(price), 1)[0].strip()
+    if not item_name:
+        await reply("بنویس: «فروش [اسم آیتم] [قیمت]»")
+        return
+
+    owned = find_owned_item(uid, item_name)
+    if not owned:
+        await reply("❌ این آیتم رو نداری که بفروشیش.")
+        return
+
+    removed = remove_item(uid, owned["category"], item_name, 1)
+    if not removed:
+        await reply("❌ مشکلی تو موجودیت پیش اومد.")
+        return
+
+    listing_id = create_listing(uid, item_name, owned["category"], 1, price)
+    await reply(f"✅ «{item_name}» با قیمت {price:,} سکه تو بازار سیاه ثبت شد (آگهی #{listing_id}).\n"
+                f"💡 مالیات فروش {int(MARKET_TAX_RATE*100)}٪ از قیمت کم میشه وقتی فروخته بشه.")
+
+
+async def handle_auction(reply, uid, text_raw):
+    """مزایده [آیتم] [قیمت پایه] [دقیقه] - فقط برای آیتم‌های Epic به بالا"""
+    rest = text_raw.replace("مزایده", "", 1).strip()
+    nums = [int(n) for n in rest.split() if n.isdigit()]
+    if len(nums) < 2:
+        await reply("بنویس: «مزایده [اسم آیتم] [قیمت پایه] [مدت به دقیقه]»\n(فقط برای آیتم‌های Epic و بالاتر)")
+        return
+    base_price, duration_min = nums[0], nums[1]
+    item_name = rest
+    for n in nums:
+        item_name = item_name.replace(str(n), "")
+    item_name = item_name.strip()
+
+    owned = find_owned_item(uid, item_name)
+    if not owned:
+        await reply("❌ این آیتم رو نداری.")
+        return
+
+    rarity = _get_item_rarity_info(item_name)
+    if rarity not in MIN_AUCTION_RARITY_ORDER:
+        await reply(f"❌ مزایده فقط برای آیتم‌های Epic به بالا مجازه. «{item_name}» کمیابیش کافی نیست.")
+        return
+
+    removed = remove_item(uid, owned["category"], item_name, 1)
+    if not removed:
+        await reply("❌ مشکلی تو موجودیت پیش اومد.")
+        return
+
+    listing_id = create_listing(uid, item_name, owned["category"], 1, base_price, is_auction=True, auction_minutes=duration_min)
+    await reply(f"🔨 مزایده‌ی «{item_name}» شروع شد! قیمت پایه: {base_price:,} سکه، مدت: {duration_min} دقیقه (آگهی #{listing_id}).\n"
+                f"بقیه می‌تونن با «پیشنهاد {listing_id} [مبلغ]» رقابت کنن.")
+
+
+async def handle_bid(reply, uid, u, text_raw):
+    """پیشنهاد [شماره آگهی] [مبلغ]"""
+    parts = text_raw.replace("پیشنهاد", "", 1).split()
+    nums = [int(p) for p in parts if p.isdigit()]
+    if len(nums) < 2:
+        await reply("بنویس: «پیشنهاد [شماره آگهی] [مبلغ]»")
+        return
+    listing_id, bid_amount = nums[0], nums[1]
+
+    listing = get_listing(listing_id)
+    if not listing or listing["status"] != "active" or not listing["is_auction"]:
+        await reply("❌ همچین مزایده‌ی فعالی پیدا نشد.")
+        return
+    if time.time() >= listing["auction_end_ts"]:
+        await reply("❌ این مزایده تموم شده.")
+        return
+    if str(listing["seller_uid"]) == str(uid):
+        await reply("❌ نمی‌تونی رو مزایده‌ی خودت پیشنهاد بدی.")
+        return
+    if bid_amount <= listing["current_bid"]:
+        await reply(f"❌ پیشنهادت باید بیشتر از {listing['current_bid']:,} باشه.")
+        return
+    if u["coins"] < bid_amount:
+        await reply("❌ سکه‌ت برای این پیشنهاد کافی نیست.")
+        return
+
+    update_listing_bid(listing_id, bid_amount, uid)
+    await reply(f"✅ پیشنهادت ({bid_amount:,} سکه) برای «{listing['item_name']}» ثبت شد.")
+
+
+async def process_expired_auctions():
+    """هر مزایده‌ای که زمانش تموم شده رو می‌بنده - برنده رو مشخص می‌کنه یا
+    به فروشنده برمی‌گردونه اگه کسی پیشنهاد نداده بود. این تابع باید دوره‌ای
+    (مثلا هر دقیقه) صدا زده بشه."""
+    for listing in get_expired_active_auctions():
+        if listing["current_bidder"]:
+            buyer = listing["current_bidder"]
+            price = listing["current_bid"]
+            tax = int(price * MARKET_TAX_RATE)
+            net = price - tax
+            remove_coins(buyer, price)
+            add_coins(listing["seller_uid"], net)
+            add_item(buyer, listing["category"], listing["item_name"], listing["qty"])
+            log_transaction(listing["seller_uid"], buyer, listing["item_name"], price, tax)
+            update_listing_status(listing["id"], "sold")
+        else:
+            add_item(listing["seller_uid"], listing["category"], listing["item_name"], listing["qty"])
+            update_listing_status(listing["id"], "expired")
+
+
+async def handle_market_list(reply, text_raw):
+    """بازار [فیلتر اختیاری]"""
+    filter_text = text_raw.replace("بازار", "", 1).strip()
+    listings = list_active_listings(limit=15, item_name_contains=filter_text or None)
+    if not listings:
+        await reply("📭 الان هیچ آگهی فعالی نیست." if not filter_text else f"📭 چیزی با «{filter_text}» پیدا نشد.")
+        return
+
+    lines = ["🖤 بازار سیاه — آگهی‌های فعال:\n"]
+    for l in listings:
+        tag = "🔨 مزایده" if l["is_auction"] else "🏷 فروش مستقیم"
+        price_show = l["current_bid"] if l["is_auction"] and l["current_bid"] else l["price"]
+        lines.append(f"#{l['id']} — {l['item_name']} | {tag} | {price_show:,} سکه")
+    lines.append("\n💡 خرید: «خرید بازار [شماره]» | مزایده: «پیشنهاد [شماره] [مبلغ]»")
+    await reply("\n".join(lines))
+
+
+async def handle_market_buy(reply, uid, u, text_raw):
+    """خرید بازار [شماره آگهی]"""
+    amount = extract_amount(text_raw)
+    if not amount:
+        await reply("بنویس: «خرید بازار [شماره آگهی]»")
+        return
+    listing_id = amount
+
+    listing = get_listing(listing_id)
+    if not listing or listing["status"] != "active":
+        await reply("❌ همچین آگهی فعالی پیدا نشد.")
+        return
+    if listing["is_auction"]:
+        await reply("❌ این یه مزایده‌ست، باید با «پیشنهاد» شرکت کنی، نه خرید مستقیم.")
+        return
+    if str(listing["seller_uid"]) == str(uid):
+        await reply("❌ نمی‌تونی جنس خودتو بخری.")
+        return
+    price = listing["price"]
+    if u["coins"] < price:
+        await reply(f"❌ سکه‌ت کافی نیست. {price - u['coins']:,} سکه‌ی دیگه لازم داری.")
+        return
+
+    tax = int(price * MARKET_TAX_RATE)
+    net_to_seller = price - tax
+
+    remove_coins(uid, price)
+    add_coins(listing["seller_uid"], net_to_seller)
+    add_item(uid, listing["category"], listing["item_name"], listing["qty"])
+    log_transaction(listing["seller_uid"], uid, listing["item_name"], price, tax)
+    update_listing_status(listing_id, "sold")
+
+    unlock_achievement(uid, "first_market_purchase")
+    unlock_achievement(listing["seller_uid"], "first_market_sale")
+
+    await reply(f"✅ «{listing['item_name']}» رو با {price:,} سکه خریدی!")
+
+
+async def handle_market_cancel(reply, uid, text_raw):
+    """لغو آگهی [شماره]"""
+    amount = extract_amount(text_raw)
+    if not amount:
+        await reply("بنویس: «لغو آگهی [شماره]»")
+        return
+    listing_id = amount
+    listing = get_listing(listing_id)
+    if not listing or listing["status"] != "active":
+        await reply("❌ همچین آگهی فعالی پیدا نشد.")
+        return
+    if str(listing["seller_uid"]) != str(uid):
+        await reply("❌ این آگهی مال تو نیست.")
+        return
+
+    add_item(uid, listing["category"], listing["item_name"], listing["qty"])
+    update_listing_status(listing_id, "cancelled")
+    await reply(f"✅ آگهی #{listing_id} لغو شد و آیتمت برگشت.")
+
+
+async def handle_market_history(reply, uid):
+    history = get_user_transaction_history(uid, limit=10)
+    if not history:
+        await reply("📭 هنوز هیچ معامله‌ای نداشتی.")
+        return
+    lines = ["📜 تاریخچه‌ی معاملات تو:\n"]
+    for h in history:
+        role = "فروختی" if str(h["seller_uid"]) == str(uid) else "خریدی"
+        lines.append(f"• {h['item_name']} — {role} به قیمت {h['price']:,} (مالیات: {h['tax']:,})")
+    await reply("\n".join(lines))
+
+
+# ==============================================================================
+# بخش ۱۲: کلن/گیلد، لیدربورد، دستاورد
+# ==============================================================================
+# =============================================================================
+# 🛡️ کلن / گیلد
+# =============================================================================
+async def handle_create_clan(reply, uid, text_raw):
+    name = text_raw.replace("کلن بساز", "", 1).strip()
+    if not name:
+        await reply("بنویس: «کلن بساز [اسم کلن]»")
+        return
+    if get_user_clan(uid):
+        await reply("❌ تو از قبل عضو یه کلنی. اول ازش خارج شو («خروج از کلن»).")
+        return
+    if get_clan_by_name(name):
+        await reply("❌ این اسم کلن قبلاً گرفته شده.")
+        return
+
+    clan_id = create_clan(name, uid)
+    await reply(f"🛡️ کلن «{name}» ساخته شد! تو رهبرشی.\nبقیه می‌تونن با «عضویت در کلن {name}» بهت ملحق بشن.")
+
+
+async def handle_join_clan(reply, uid, text_raw):
+    name = text_raw.replace("عضویت در کلن", "", 1).strip()
+    if not name:
+        await reply("بنویس: «عضویت در کلن [اسم کلن]»")
+        return
+    if get_user_clan(uid):
+        await reply("❌ تو از قبل عضو یه کلنی.")
+        return
+    clan = get_clan_by_name(name)
+    if not clan:
+        await reply("❌ همچین کلنی پیدا نشد. بنویس «کلن‌ها» برای دیدن لیست.")
+        return
+    join_clan(clan["id"], uid)
+    await reply(f"✅ به کلن «{name}» ملحق شدی!")
+
+
+async def handle_leave_clan(reply, uid):
+    clan = get_user_clan(uid)
+    if not clan:
+        await reply("❌ تو عضو هیچ کلنی نیستی.")
+        return
+    leave_clan(clan["id"], uid)
+    await reply(f"👋 از کلن «{clan['name']}» خارج شدی.")
+
+
+async def handle_clan_list(reply):
+    clans = all_clans(limit=20)
+    if not clans:
+        await reply("📭 هنوز هیچ کلنی ساخته نشده. بنویس «کلن بساز [اسم]» تا اولیش رو بسازی!")
+        return
+    lines = ["🛡️ لیست کلن‌ها:\n"]
+    for c in clans:
+        members_count = len(get_clan_members(c["id"]))
+        lines.append(f"• {c['name']} — {members_count} عضو")
+    await reply("\n".join(lines))
+
+
+async def handle_my_clan(reply, uid):
+    clan = get_user_clan(uid)
+    if not clan:
+        await reply("❌ تو عضو هیچ کلنی نیستی. بنویس «کلن‌ها» یا «کلن بساز [اسم]».")
+        return
+    members = get_clan_members(clan["id"])
+    role = "👑 رهبر" if str(clan["owner_uid"]) == str(uid) else "عضو"
+    await reply(f"🛡️ کلن: {clan['name']}\nمقام تو: {role}\nتعداد اعضا: {len(members)}")
+
+
+# =============================================================================
+# 🏆 لیدربوردهای اضافی (سکه، برد، تعداد آیتم)
+# =============================================================================
+def _display_name_short(u):
+    return u.get("display_name") or f"کاربر {u['uid'][-6:]}"
+
+
+async def handle_leaderboard_coins(reply):
+    top = top_users_by_coins(10)
+    if not top:
+        await reply("هنوز کسی سکه‌ای نداره.")
+        return
+    lines = ["🥇 برترین‌های سکه 💰\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, u in enumerate(top):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        lines.append(f"{medal} {_display_name_short(u)} — {u['coins']:,} سکه")
+    await reply("\n".join(lines))
+
+
+async def handle_leaderboard_wins(reply):
+    top = top_users_by_wins(10)
+    if not top:
+        await reply("هنوز کسی بردی نداشته.")
+        return
+    lines = ["🥇 برترین‌های برد 🏆\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, u in enumerate(top):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        lines.append(f"{medal} {_display_name_short(u)} — {u['wins']:,} برد")
+    await reply("\n".join(lines))
+
+
+async def handle_leaderboard_items(reply):
+    top = top_users_by_item_count(10)
+    if not top:
+        await reply("هنوز کسی آیتمی نداره.")
+        return
+    lines = ["🥇 برترین‌های کلکسیون 🎒\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, row in enumerate(top):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        u = get_user(row["uid"])
+        lines.append(f"{medal} {_display_name_short(u)} — {row['total_items']:,} آیتم")
+    await reply("\n".join(lines))
+
+
+# =============================================================================
+# 🏅 دستاوردها
+# =============================================================================
+ACHIEVEMENT_LABELS = {
+    "first_trade": "🤝 اولین معامله",
+    "first_market_purchase": "🛒 اولین خرید بازار",
+    "first_market_sale": "💰 اولین فروش بازار",
+    "boss_slayer": "👹 نابودگر رئیس",
+    "level_10": "⭐ رسیدن به سطح ۱۰",
+    "level_25": "🌟 رسیدن به سطح ۲۵",
+    "rich_1m": "💎 میلیونر (۱ میلیون سکه)",
+}
+
+
+async def handle_achievements(reply, uid, u):
+    unlocked = set(get_user_achievements(uid))
+
+    # چک خودکار چندتا دستاورد ساده بر اساس وضعیت فعلی
+    if u["coins"] >= 1_000_000:
+        unlock_achievement(uid, "rich_1m")
+        unlocked.add("rich_1m")
+    level = get_level(u["xp"])
+    if level >= 10:
+        unlock_achievement(uid, "level_10")
+        unlocked.add("level_10")
+    if level >= 25:
+        unlock_achievement(uid, "level_25")
+        unlocked.add("level_25")
+
+    lines = ["🏅 دستاوردهای تو:\n"]
+    for key, label in ACHIEVEMENT_LABELS.items():
+        status = "✅" if key in unlocked else "🔒"
+        lines.append(f"{status} {label}")
+    await reply("\n".join(lines))
+
+
+# ==============================================================================
+# بخش ۱۳: مینی‌گیم‌های جدید
+# ==============================================================================
+# =============================================================================
+# 🗺️ شکار گنج - ۵ نقطه، فقط یکیش گنج داره
+# =============================================================================
+active_treasure = {}  # {uid: True} یعنی منتظر انتخاب نقطه‌ست
+TREASURE_ENTRY_FEE = 50
+TREASURE_REWARD_RANGE = (100, 500)
+TREASURE_TRAP_LOSS_RANGE = (30, 100)
+
+
+async def handle_start_treasure(reply, uid, u):
+    if u["coins"] < TREASURE_ENTRY_FEE:
+        await reply(f"❌ برای شکار گنج {TREASURE_ENTRY_FEE} سکه ورودی لازمه، سکه‌ت کافی نیست.")
+        return
+    remove_coins(uid, TREASURE_ENTRY_FEE)
+    active_treasure[uid] = True
+    await reply(f"🗺️ نقشه‌ی گنج پیدا کردی! ({TREASURE_ENTRY_FEE} سکه ورودی گرفته شد)\n"
+                "۵ نقطه‌ی حفاری هست:\n1️⃣ 2️⃣ 3️⃣ 4️⃣ 5️⃣\nیه عدد از ۱ تا ۵ رو بنویس تا اونجا رو حفر کنی.")
+
+
+async def try_handle_treasure_input(reply, uid, text_raw):
+    if uid not in active_treasure:
+        return False
+    stripped = text_raw.strip()
+    if stripped not in ("1", "2", "3", "4", "5", "۱", "۲", "۳", "۴", "۵"):
+        return False
+
+    del active_treasure[uid]
+    winning_spot = random.randint(1, 5)
+    chosen = {"۱": 1, "۲": 2, "۳": 3, "۴": 4, "۵": 5}.get(stripped, int(stripped) if stripped.isdigit() else 0)
+
+    if chosen == winning_spot:
+        reward = random.randint(*TREASURE_REWARD_RANGE)
+        add_coins(uid, reward)
+        add_xp(uid, 20)
+        await reply(f"💰 پیدا کردی! یه گنج تو نقطه‌ی {chosen} بود!\n💰 +{reward:,} سکه | ✨ +20 XP")
+    else:
+        if random.random() < 0.4:
+            loss = random.randint(*TREASURE_TRAP_LOSS_RANGE)
+            remove_coins(uid, loss)
+            await reply(f"💥 تله بود! گنج تو نقطه‌ی {winning_spot} بود، تو {chosen} رو زدی.\n💸 -{loss:,} سکه از تله")
+        else:
+            await reply(f"🕳 هیچی نبود. گنج واقعی تو نقطه‌ی {winning_spot} بود.")
+    return True
+
+
+# =============================================================================
+# 🔐 گاوصندوق - کد رو با ۵ تلاش محدود حدس بزن
+# =============================================================================
+active_safe = {}  # {uid: {"code": int, "tries": int, "max_tries": int}}
+SAFE_ENTRY_FEE = 100
+SAFE_MAX_TRIES = 5
+SAFE_REWARD_RANGE = (400, 1200)
+
+
+async def handle_start_safe(reply, uid, u):
+    if u["coins"] < SAFE_ENTRY_FEE:
+        await reply(f"❌ برای باز کردن گاوصندوق {SAFE_ENTRY_FEE} سکه ورودی لازمه.")
+        return
+    remove_coins(uid, SAFE_ENTRY_FEE)
+    active_safe[uid] = {"code": random.randint(1, 50), "tries": 0, "max_tries": SAFE_MAX_TRIES}
+    await reply(f"🔐 گاوصندوق قفله! ({SAFE_ENTRY_FEE} سکه ورودی گرفته شد)\n"
+                f"کد بین ۱ تا ۵۰ ئه. فقط {SAFE_MAX_TRIES} تلاش داری. یه عدد بنویس!")
+
+
+async def try_handle_safe_input(reply, uid, text_raw):
+    if uid not in active_safe:
+        return False
+    if not text_raw.strip().isdigit():
+        return False
+
+    state = active_safe[uid]
+    guess = int(text_raw.strip())
+    state["tries"] += 1
+    remaining = state["max_tries"] - state["tries"]
+
+    if guess == state["code"]:
+        reward = random.randint(*SAFE_REWARD_RANGE)
+        add_coins(uid, reward)
+        add_xp(uid, 35)
+        del active_safe[uid]
+        await reply(f"🔓 بازش کردی!! کد {state['code']} بود!\n💰 +{reward:,} سکه | ✨ +35 XP")
+        return True
+
+    if remaining <= 0:
+        del active_safe[uid]
+        await reply(f"🔒 تلاش‌هات تموم شد! کد درست {state['code']} بود. گاوصندوق برای همیشه قفل موند.")
+        return True
+
+    hint = "بزرگ‌تره 🔼" if guess < state["code"] else "کوچیک‌تره 🔽"
+    await reply(f"❌ اشتباهه، {hint} ({remaining} تلاش مونده)")
+    return True
+
+
+# =============================================================================
+# 🚔 دزد و پلیس - ریسک بالا برای دزدی بزرگ
+# =============================================================================
+THIEF_ENTRY_FEE = 80
+THIEF_SUCCESS_CHANCE = 0.35
+THIEF_REWARD_RANGE = (200, 700)
+THIEF_CAUGHT_LOSS_RANGE = (100, 300)
+
+
+async def handle_thief_police(reply, uid, u):
+    if u["coins"] < THIEF_ENTRY_FEE:
+        await reply(f"❌ برای این دزدی {THIEF_ENTRY_FEE} سکه هزینه‌ی تجهیزات لازمه.")
+        return
+    remove_coins(uid, THIEF_ENTRY_FEE)
+
+    if random.random() < THIEF_SUCCESS_CHANCE:
+        reward = random.randint(*THIEF_REWARD_RANGE)
+        add_coins(uid, reward)
+        add_xp(uid, 15)
+        await reply(f"🕵️ موفق شدی فرار کنی با غنیمت!\n💰 +{reward:,} سکه | ✨ +15 XP")
+    else:
+        loss = random.randint(*THIEF_CAUGHT_LOSS_RANGE)
+        remove_coins(uid, loss)
+        await reply(f"🚔 پلیس گرفتت! جریمه شدی.\n💸 -{loss:,} سکه")
+
+
+# =============================================================================
+# ⚔️ دوئل - بین دو بازیکن واقعی (با ریپلای)
+# =============================================================================
+pending_duels = {}  # {target_uid: {"challenger": uid, "amount": int, "expires_ts": float}}
+DUEL_EXPIRY_SECONDS = 120
+DUEL_TAX_RATE = 0.05
+
+
+async def handle_start_duel(reply, uid, u, text_raw, reply_sender_uid):
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای باهاش دوئل کنی ریپلای بزنی.")
+        return
+    if str(reply_sender_uid) == str(uid):
+        await reply("❌ نمی‌تونی با خودت دوئل کنی.")
+        return
+    amount_str = "".join(ch for ch in text_raw if ch.isdigit())
+    if not amount_str:
+        await reply("بنویس: (ریپلای) «دوئل [مبلغ شرط]»")
+        return
+    amount = int(amount_str)
+    if amount <= 0:
+        await reply("مبلغ باید بزرگتر از صفر باشه.")
+        return
+    if u["coins"] < amount:
+        await reply("❌ سکه‌ت برای این دوئل کافی نیست.")
+        return
+
+    pending_duels[reply_sender_uid] = {
+        "challenger": uid, "amount": amount, "expires_ts": time.time() + DUEL_EXPIRY_SECONDS
+    }
+    await reply(f"⚔️ درخواست دوئل با شرط {amount:,} سکه فرستاده شد!\n"
+                f"طرف مقابل باید تا {DUEL_EXPIRY_SECONDS} ثانیه بنویسه «قبول دوئل» تا شروع بشه.")
+
+
+async def try_handle_duel_accept(reply, uid, u, text_raw):
+    if text_raw.strip() != "قبول دوئل":
+        return False
+    challenge = pending_duels.get(uid)
+    if not challenge:
+        await reply("❌ هیچ درخواست دوئلی برات ثبت نشده.")
+        return True
+    if time.time() >= challenge["expires_ts"]:
+        del pending_duels[uid]
+        await reply("⌛ زمان قبول این دوئل تموم شده.")
+        return True
+
+    challenger = challenge["challenger"]
+    amount = challenge["amount"]
+    challenger_u = get_user(challenger)
+
+    if u["coins"] < amount:
+        del pending_duels[uid]
+        await reply("❌ سکه‌ت برای قبول این دوئل کافی نیست.")
+        return True
+    if challenger_u["coins"] < amount:
+        del pending_duels[uid]
+        await reply("❌ طرف مقابل دیگه سکه‌ی کافی نداره، دوئل لغو شد.")
+        return True
+
+    del pending_duels[uid]
+
+    winner = random.choice([uid, challenger])
+    loser = challenger if winner == uid else uid
+    pot = amount * 2
+    tax = int(pot * DUEL_TAX_RATE)
+    net = pot - tax
+
+    remove_coins(uid, amount)
+    remove_coins(challenger, amount)
+    add_coins(winner, net)
+    increment_wins(winner)
+
+    await reply(f"⚔️💥 دوئل تموم شد!\n👑 برنده: آیدی {winner}\n💰 جایزه: {net:,} سکه (بعد از {int(DUEL_TAX_RATE*100)}٪ مالیات)")
+    return True
+
+
+# ==============================================================================
+# بخش ۱۴: سیستم اسپاون
+# ==============================================================================
+SPAWN_INTERVAL_SECONDS = 30 * 60   # هر ۳۰ دقیقه
+SPAWN_WINDOW_SECONDS = 30          # ۳۰ ثانیه در دسترسه
+
+_spawn_background_tasks = set()
+
+
+def _weighted_catalog_choice():
+    """یه آیتم بر اساس وزن کمیابی انتخاب می‌کنه. OG فقط اگه هنوز کسی
+    نگرفته باشدش، با شانس خیلی خیلی کم وارد استخر میشه."""
+    pool = list(ITEM_CATALOG)
+    weights = [RARITY_INFO[item["rarity"]]["spawn_weight"] for item in pool]
+
+    if get_state("og_claimed", "0") != "1":
+        pool = pool + [OG_ITEM]
+        weights = weights + [3]  # شانس خیلی ناچیز نسبت به بقیه (مجموع وزن‌ها هزاران واحده)
+
+    return random.choices(pool, weights=weights, k=1)[0]
+
+
+def get_current_spawn():
+    name = get_state("spawn_item_name")
+    if not name:
+        return None
+    expires = float(get_state("spawn_expires_ts", "0"))
+    if time.time() >= expires:
+        return None
+    return {
+        "name": name,
+        "category": get_state("spawn_category", ""),
+        "rarity": get_state("spawn_rarity", "Common"),
+        "price": int(get_state("spawn_price", "0")),
+        "xp": int(get_state("spawn_xp", "0")),
+        "expires_ts": expires,
+    }
+
+
+def clear_spawn():
+    set_state("spawn_item_name", "")
+    set_state("spawn_expires_ts", "0")
+
+
+async def handle_claim_spawn(reply, uid):
+    spawn = get_current_spawn()
+    if not spawn:
+        await reply("😅 الان هیچی اسپون نشده. منتظر اسپون بعدی باش (هر ۳۰ دقیقه یه‌بار).")
+        return
+
+    clear_spawn()  # فوراً پاک میشه تا کس دیگه‌ای هم‌زمان نگیرتش (race condition)
+
+    category = "og" if spawn["rarity"] == "OG" else "catalog"
+    add_item(uid, category, spawn["name"], 1)
+    add_xp(uid, spawn["xp"])
+
+    if spawn["rarity"] == "OG":
+        set_state("og_claimed", "1")
+        await reply(f"🌟👑 باورنکردنیه!! تو تنها آیتم OG کل بازی رو گرفتی: {spawn['name']}!\n"
+                    f"این آیتم دیگه هیچ‌وقت اسپون نمیشه، مال تو شد برای همیشه!\n✨ +{spawn['xp']:,} XP")
+    else:
+        rarity_label = RARITY_INFO[spawn["rarity"]]["label"]
+        await reply(f"🎁 گرفتیش! {spawn['name']} ({rarity_label})\n💎 ارزش: {spawn['price']:,} سکه | ✨ +{spawn['xp']} XP\n"
+                    f"می‌تونی تو بازار سیاه بفروشیش: «فروش {spawn['name']} [قیمت]»")
+
+
+async def handle_spawn_status(reply):
+    spawn = get_current_spawn()
+    if not spawn:
+        await reply("😴 الان چیزی اسپون نشده. هر ۳۰ دقیقه یه آیتم تصادفی ظاهر میشه، منتظر باش!")
+        return
+    remaining = max(0, int(spawn["expires_ts"] - time.time()))
+    rarity_label = RARITY_INFO[spawn["rarity"]]["label"]
+    await reply(f"✨ یه آیتم اسپون شده: {spawn['name']} ({rarity_label})\n"
+                f"⏳ {remaining} ثانیه فرصت داری، بنویس «بگیرش»!")
+
+
+async def _do_spawn(bot):
+    item = _weighted_catalog_choice()
+
+    set_state("spawn_item_name", item["name"])
+    set_state("spawn_category", item["category"])
+    set_state("spawn_rarity", item["rarity"])
+    set_state("spawn_price", item["price"])
+    set_state("spawn_xp", item["xp"])
+    set_state("spawn_expires_ts", time.time() + SPAWN_WINDOW_SECONDS)
+
+    rarity_label = RARITY_INFO[item["rarity"]]["label"]
+    targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
+
+    async def send_fn(chat_id, text):
+        await maybe_await(bot.send_message(chat_id, text))
+
+    text = (f"✨ یه آیتم اسپون شد: {item['name']} ({rarity_label})!\n"
+            f"⏳ فقط {SPAWN_WINDOW_SECONDS} ثانیه فرصت داری، زودتر بنویس «بگیرش»!")
+    await rate_limited_broadcast(send_fn, targets, text)
+
+    await asyncio.sleep(SPAWN_WINDOW_SECONDS)
+    # اگه هنوزم اسپون فعاله (کسی نگرفته)، پاکش کن
+    if get_current_spawn() and get_current_spawn()["name"] == item["name"]:
+        clear_spawn()
+
+
+async def _spawn_loop(bot):
+    while True:
+        await asyncio.sleep(SPAWN_INTERVAL_SECONDS)
+        try:
+            await _do_spawn(bot)
+        except Exception as e:
+            print("خطا تو اسپون:", e)
+
+
+def start_spawn_loop(bot):
+    task = asyncio.create_task(_spawn_loop(bot))
+    _spawn_background_tasks.add(task)
+    task.add_done_callback(_spawn_background_tasks.discard)
+
+
+# ==============================================================================
+# بخش ۱۵: روتر اصلی و اجرای ربات
 # ==============================================================================
 bot = Robot(token=BOT_TOKEN)
 init_db()
+
+
+async def _periodic_auction_check():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await process_expired_auctions()
+        except Exception as e:
+            print("خطا تو چک کردن مزایده‌های تموم‌شده:", e)
 
 
 def get_uid(message):
@@ -2959,6 +5541,15 @@ async def dispatcher(bot: Robot, message: Message):
     if await try_handle_pending_game_input(reply, uid, u, text_raw):
         return
 
+    if await try_handle_treasure_input(reply, uid, text_raw):
+        return
+
+    if await try_handle_safe_input(reply, uid, text_raw):
+        return
+
+    if await try_handle_duel_accept(reply, uid, u, text_raw):
+        return
+
     # =========================================================================
     # ---- مود (بررسی زودهنگام چون startswith مشخصیه) ----
     # =========================================================================
@@ -3002,8 +5593,68 @@ async def dispatcher(bot: Robot, message: Message):
         )
         return
 
+    # ⚠️ لیدربوردهای اختصاصی باید قبل از «رتبه» عمومی چک بشن
+    if "رتبه سکه" in text_raw:
+        await handle_leaderboard_coins(reply); return
+    if "رتبه برد" in text_raw:
+        await handle_leaderboard_wins(reply); return
+    if "رتبه آیتم" in text_raw:
+        await handle_leaderboard_items(reply); return
     if "رتبه" in text_raw:
         await handle_leaderboard(reply); return
+
+    if "دستاوردها" in text_raw:
+        await handle_achievements(reply, uid, u); return
+
+    # =========================================================================
+    # ---- هدیه / انتقال بین کاربران ----
+    # =========================================================================
+    if text_raw.startswith("هدیه سکه"):
+        await handle_gift_coins(reply, uid, u, text_raw, reply_sender_uid); return
+    if text_raw.startswith("هدیه ایکس پی") or text_raw.startswith("هدیه اکس پی"):
+        await handle_gift_xp(reply, uid, u, text_raw, reply_sender_uid); return
+    if text_raw.startswith("هدیه آیتم"):
+        await handle_gift_item(reply, uid, text_raw, reply_sender_uid); return
+
+    # =========================================================================
+    # ---- بازار سیاه ----
+    # =========================================================================
+    if text_raw.startswith("خرید بازار"):
+        await handle_market_buy(reply, uid, u, text_raw); return
+    if text_raw.startswith("لغو آگهی"):
+        await handle_market_cancel(reply, uid, text_raw); return
+    if text_raw.startswith("مزایده"):
+        await handle_auction(reply, uid, text_raw); return
+    if text_raw.startswith("پیشنهاد"):
+        await handle_bid(reply, uid, u, text_raw); return
+    if text_raw.startswith("فروش"):
+        await handle_sell(reply, uid, text_raw); return
+    if "تاریخچه معاملات" in text_raw:
+        await handle_market_history(reply, uid); return
+    if text_raw.startswith("بازار"):
+        await handle_market_list(reply, text_raw); return
+
+    # =========================================================================
+    # ---- سیستم اسپاون ----
+    # =========================================================================
+    if text_raw == "بگیرش":
+        await handle_claim_spawn(reply, uid); return
+    if "وضعیت اسپاون" in text_raw or "وضعیت اسپون" in text_raw:
+        await handle_spawn_status(reply); return
+
+    # =========================================================================
+    # ---- کلن/گیلد ----
+    # =========================================================================
+    if text_raw.startswith("کلن بساز"):
+        await handle_create_clan(reply, uid, text_raw); return
+    if text_raw.startswith("عضویت در کلن"):
+        await handle_join_clan(reply, uid, text_raw); return
+    if text_raw == "خروج از کلن":
+        await handle_leave_clan(reply, uid); return
+    if text_raw == "کلن‌ها" or text_raw == "کلن ها":
+        await handle_clan_list(reply); return
+    if text_raw == "کلن من":
+        await handle_my_clan(reply, uid); return
 
     # =========================================================================
     # ---- اقتصاد ----
@@ -3030,8 +5681,21 @@ async def dispatcher(bot: Robot, message: Message):
     if "فروشگاه" in text_raw:
         await handle_shop(reply); return
 
+    # ⚠️ «شکار گنج» باید قبل از «شکار» عمومی چک بشه
+    if "شکار گنج" in text_raw:
+        await handle_start_treasure(reply, uid, u); return
+
     if "شکار" in text_raw:
         await handle_hunt(reply, uid, u); return
+
+    if "گاوصندوق" in text_raw:
+        await handle_start_safe(reply, uid, u); return
+
+    if "دزد و پلیس" in text_raw:
+        await handle_thief_police(reply, uid, u); return
+
+    if text_raw.startswith("دوئل"):
+        await handle_start_duel(reply, uid, u, text_raw, reply_sender_uid); return
 
     # =========================================================================
     # ---- بازی‌ها ----
@@ -3080,6 +5744,12 @@ async def dispatcher(bot: Robot, message: Message):
 
     if "وضعیت پارتی" in text_raw:
         await handle_party_status(reply); return
+
+    if text_raw == "حمله":
+        await handle_attack(reply, uid); return
+
+    if "وضعیت رئیس" in text_raw:
+        await handle_boss_status(reply); return
 
     if text_raw.startswith("شرط"):
         await handle_bet(reply, uid, u, text_raw); return
@@ -3241,7 +5911,28 @@ def start_keep_alive_server():
         print("خطا در keep-alive:", e)
 
 
+def _start_background_jobs():
+    """
+    سیستم اسپاون و چک مزایده‌های تموم‌شده باید مستقل از loop اصلی ربات
+    (که خود bot.run() مدیریتش می‌کنه) اجرا بشن، چون مطمئن نیستیم rubka
+    قلاب (hook) رسمی برای «کارهای پس‌زمینه» داره یا نه. برای همین یه
+    event loop جدا تو یه ترد جدا می‌سازیم و کارای دوره‌ای رو همونجا اجرا
+    می‌کنیم. اگه بعداً معلوم شد rubka خودش loop اختصاصی می‌خواد، این بخش
+    باید با قلاب رسمی‌ش جایگزین بشه.
+    """
+    loop = asyncio.new_event_loop()
+
+    def runner():
+        asyncio.set_event_loop(loop)
+        loop.create_task(_spawn_loop(bot))
+        loop.create_task(_periodic_auction_check())
+        loop.run_forever()
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
 if __name__ == "__main__":
     start_keep_alive_server()
+    _start_background_jobs()
     print("🚀 VANTA PERSIA v2 در حال اجراست...")
     bot.run()
