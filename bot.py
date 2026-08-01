@@ -5388,7 +5388,11 @@ async def _do_spawn(bot):
     set_state("spawn_expires_ts", time.time() + SPAWN_WINDOW_SECONDS)
 
     rarity_label = RARITY_INFO[item["rarity"]]["label"]
-    targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
+
+    # هم به پیوی کسایی که استارت زدن، هم به همه‌ی گروه‌های ثبت‌شده می‌فرسته
+    pv_targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
+    group_targets = [g["chat_id"] for g in all_registered_groups()]
+    targets = pv_targets + group_targets
 
     async def send_fn(chat_id, text):
         await maybe_await(bot.send_message(chat_id, text))
@@ -5404,6 +5408,14 @@ async def _do_spawn(bot):
 
 
 async def _spawn_loop(bot):
+    # اولین اسپون تقریباً فوریه (بعد از یه مکث کوتاه که ربات کامل بالا بیاد)
+    # نه اینکه ۳۰ دقیقه صبر کنیم تا چیزی نشون داده بشه
+    await asyncio.sleep(20)
+    try:
+        await _do_spawn(bot)
+    except Exception as e:
+        print("خطا تو اولین اسپون:", e)
+
     while True:
         await asyncio.sleep(SPAWN_INTERVAL_SECONDS)
         try:
