@@ -5436,6 +5436,8 @@ def start_spawn_loop(bot):
 bot = Robot(token=BOT_TOKEN)
 init_db()
 
+_background_jobs_started = False
+
 
 async def _periodic_auction_check():
     while True:
@@ -5465,6 +5467,17 @@ message_senders = {}
 
 @bot.on_message()
 async def dispatcher(bot: Robot, message: Message):
+    global _background_jobs_started
+    if not _background_jobs_started:
+        # این کارای پس‌زمینه (اسپاون، چک مزایده) رو همینجا استارت می‌زنیم -
+        # نه تو یه ترد/loop جدا - چون این تابع دقیقاً رو همون event loopـی
+        # اجرا میشه که خود ربات (bot.send_message و بقیه) روش کار می‌کنه.
+        # این‌جوری هیچ‌وقت قاطی loop پیش نمیاد.
+        _background_jobs_started = True
+        asyncio.create_task(_spawn_loop(bot))
+        asyncio.create_task(_periodic_auction_check())
+        print("✅ کارای پس‌زمینه (اسپاون + چک مزایده) استارت خوردن")
+
     dedupe_id = getattr(message, "message_id", None)
     if dedupe_id:
         if dedupe_id in processed_message_ids:
@@ -5923,28 +5936,7 @@ def start_keep_alive_server():
         print("خطا در keep-alive:", e)
 
 
-def _start_background_jobs():
-    """
-    سیستم اسپاون و چک مزایده‌های تموم‌شده باید مستقل از loop اصلی ربات
-    (که خود bot.run() مدیریتش می‌کنه) اجرا بشن، چون مطمئن نیستیم rubka
-    قلاب (hook) رسمی برای «کارهای پس‌زمینه» داره یا نه. برای همین یه
-    event loop جدا تو یه ترد جدا می‌سازیم و کارای دوره‌ای رو همونجا اجرا
-    می‌کنیم. اگه بعداً معلوم شد rubka خودش loop اختصاصی می‌خواد، این بخش
-    باید با قلاب رسمی‌ش جایگزین بشه.
-    """
-    loop = asyncio.new_event_loop()
-
-    def runner():
-        asyncio.set_event_loop(loop)
-        loop.create_task(_spawn_loop(bot))
-        loop.create_task(_periodic_auction_check())
-        loop.run_forever()
-
-    threading.Thread(target=runner, daemon=True).start()
-
-
 if __name__ == "__main__":
     start_keep_alive_server()
-    _start_background_jobs()
     print("🚀 VANTA PERSIA v2 در حال اجراست...")
     bot.run()
