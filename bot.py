@@ -69,6 +69,13 @@ BOT_BRAND = _get_env("BOT_BRAND", default="VANTA PERSIA")
 BOT_NAME_TRIGGER = _get_env("BOT_NAME_TRIGGER", default="پرسیا")
 OWNER_USERNAME = _get_env("OWNER_USERNAME", default="@Kaveroxkop7")
 OWNER_LINK = f"https://rubika.ir/{OWNER_USERNAME.lstrip('@')}"
+GROUP_LINK = _get_env("GROUP_LINK", default="https://rubika.ir/joing/BAGGDEDGA0FBBEEMSRWFTVMZDCOXSOOH")
+
+# ---------------------------------------------------------------------------
+# رمز عبور «ادمین سکه» - فقط اجازه‌ی اضافه/کم‌کردن سکه داره، هیچ قدرت دیگه‌ای نه
+# حتماً تو .env عوضش کن اگه می‌خوای امن‌تر باشه
+# ---------------------------------------------------------------------------
+COIN_ADMIN_PASSWORD = _get_env("COIN_ADMIN_PASSWORD", default="VANTA-COIN-7841")
 
 # ---------------------------------------------------------------------------
 # دیتابیس - فایل SQLite کنار پروژه (تو دیسک هاست پایدار می‌مونه)
@@ -212,6 +219,54 @@ def init_db():
                 achievement_key TEXT,
                 unlocked_at INTEGER DEFAULT 0,
                 PRIMARY KEY (uid, achievement_key)
+            )
+        """)
+
+        # ---- جنگ جهانی ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS war_games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT,
+                status TEXT DEFAULT 'lobby',   -- lobby | active | ended
+                next_tick_ts INTEGER DEFAULT 0,
+                tick_number INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS war_players (
+                game_id INTEGER,
+                uid TEXT,
+                color_index INTEGER,
+                alive INTEGER DEFAULT 1,
+                ally_uid TEXT DEFAULT '',
+                PRIMARY KEY (game_id, uid)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS war_regions (
+                game_id INTEGER,
+                region_key TEXT,
+                owner_uid TEXT DEFAULT '',
+                troops INTEGER DEFAULT 0,
+                PRIMARY KEY (game_id, region_key)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS war_orders (
+                game_id INTEGER,
+                uid TEXT,
+                source_key TEXT,
+                target_key TEXT,
+                percent INTEGER,
+                PRIMARY KEY (game_id, uid)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS coin_admins (
+                uid TEXT PRIMARY KEY,
+                granted_by TEXT,
+                granted_at INTEGER DEFAULT 0
             )
         """)
         cur.execute("""
@@ -840,6 +895,153 @@ def top_users_by_item_count(limit=10):
         GROUP BY uid ORDER BY total_items DESC LIMIT ?
     """, (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+# ============================================================================
+# ⚔️ جنگ جهانی
+# ============================================================================
+def get_active_war_game(chat_id):
+    cur = read_cursor()
+    row = cur.execute(
+        "SELECT * FROM war_games WHERE chat_id=? AND status IN ('lobby','active') ORDER BY id DESC LIMIT 1",
+        (str(chat_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_war_game(chat_id):
+    with write_cursor() as cur:
+        cur.execute(
+            "INSERT INTO war_games (chat_id, status, created_at) VALUES (?, 'lobby', ?)",
+            (str(chat_id), int(time.time())),
+        )
+        return cur.lastrowid
+
+
+def get_war_game(game_id):
+    cur = read_cursor()
+    row = cur.execute("SELECT * FROM war_games WHERE id=?", (game_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_war_game(game_id, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields.keys())
+    vals = list(fields.values()) + [game_id]
+    with write_cursor() as cur:
+        cur.execute(f"UPDATE war_games SET {cols} WHERE id=?", vals)
+
+
+def add_war_player(game_id, uid, color_index):
+    with write_cursor() as cur:
+        cur.execute(
+            "INSERT OR IGNORE INTO war_players (game_id, uid, color_index, alive) VALUES (?,?,?,1)",
+            (game_id, str(uid), color_index),
+        )
+
+
+def get_war_players(game_id, alive_only=False):
+    cur = read_cursor()
+    q = "SELECT * FROM war_players WHERE game_id=?"
+    if alive_only:
+        q += " AND alive=1"
+    rows = cur.execute(q, (game_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_war_player(game_id, uid):
+    cur = read_cursor()
+    row = cur.execute(
+        "SELECT * FROM war_players WHERE game_id=? AND uid=?", (game_id, str(uid))
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_war_player_alive(game_id, uid, alive):
+    with write_cursor() as cur:
+        cur.execute(
+            "UPDATE war_players SET alive=? WHERE game_id=? AND uid=?",
+            (1 if alive else 0, game_id, str(uid)),
+        )
+
+
+def set_war_alliance(game_id, uid, ally_uid):
+    with write_cursor() as cur:
+        cur.execute(
+            "UPDATE war_players SET ally_uid=? WHERE game_id=? AND uid=?",
+            (str(ally_uid) if ally_uid else "", game_id, str(uid)),
+        )
+
+
+def set_war_region(game_id, region_key, owner_uid, troops):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO war_regions (game_id, region_key, owner_uid, troops) VALUES (?,?,?,?)
+            ON CONFLICT(game_id, region_key) DO UPDATE SET owner_uid=excluded.owner_uid, troops=excluded.troops
+        """, (game_id, region_key, str(owner_uid) if owner_uid else "", troops))
+
+
+def get_war_regions(game_id):
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM war_regions WHERE game_id=?", (game_id,)).fetchall()
+    return {r["region_key"]: dict(r) for r in rows}
+
+
+def get_war_regions_owned_by(game_id, uid):
+    cur = read_cursor()
+    rows = cur.execute(
+        "SELECT * FROM war_regions WHERE game_id=? AND owner_uid=?", (game_id, str(uid))
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_war_order(game_id, uid, source_key, target_key, percent):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO war_orders (game_id, uid, source_key, target_key, percent) VALUES (?,?,?,?,?)
+            ON CONFLICT(game_id, uid) DO UPDATE SET source_key=excluded.source_key,
+                target_key=excluded.target_key, percent=excluded.percent
+        """, (game_id, str(uid), source_key, target_key, percent))
+
+
+def get_war_orders(game_id):
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM war_orders WHERE game_id=?", (game_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_war_orders(game_id):
+    with write_cursor() as cur:
+        cur.execute("DELETE FROM war_orders WHERE game_id=?", (game_id,))
+
+
+def get_all_active_war_games():
+    cur = read_cursor()
+    rows = cur.execute("SELECT * FROM war_games WHERE status IN ('lobby','active')").fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# 🪙 ادمین سکه (دسترسی محدود - فقط اضافه/کم‌کردن سکه)
+# ============================================================================
+def grant_coin_admin(uid, granted_by):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO coin_admins (uid, granted_by, granted_at) VALUES (?,?,?)
+            ON CONFLICT(uid) DO UPDATE SET granted_by=excluded.granted_by, granted_at=excluded.granted_at
+        """, (str(uid), str(granted_by), int(time.time())))
+
+
+def revoke_coin_admin(uid):
+    with write_cursor() as cur:
+        cur.execute("DELETE FROM coin_admins WHERE uid=?", (str(uid),))
+
+
+def is_coin_admin(uid):
+    cur = read_cursor()
+    row = cur.execute("SELECT 1 FROM coin_admins WHERE uid=?", (str(uid),)).fetchone()
+    return bool(row)
 
 
 # ==============================================================================
@@ -2801,6 +3003,73 @@ ITEM_CATALOG = [
 
 ITEM_CATALOG_BY_NAME = {item['name']: item for item in ITEM_CATALOG}
 ITEM_CATALOG_BY_NAME[OG_ITEM['name']] = OG_ITEM
+# =============================================================================
+# ⚔️ جنگ جهانی (World War) - نقشه‌ی ۴×۴ برای بازی نوبتی تصرف سرزمین
+# =============================================================================
+WAR_GRID_SIZE = 4
+WAR_REGION_NAMES = [
+    "شمال یخی", "دشت شمالی", "کوهستان شرقی", "ساحل شرقی",
+    "جنگل غربی", "دشت مرکزی", "تپه‌های مرکزی", "دلتای شرقی",
+    "صحرای غربی", "واحه مرکزی", "باتلاق جنوبی", "بندر جنوبی",
+    "کویر غربی", "دشت جنوبی", "جزیره جنوبی", "قطب جنوبی",
+]
+
+def build_war_regions():
+    regions = []
+    idx = 0
+    for row in range(WAR_GRID_SIZE):
+        for col in range(WAR_GRID_SIZE):
+            regions.append({
+                "key": f"r{row}c{col}",
+                "name": WAR_REGION_NAMES[idx],
+                "row": row, "col": col,
+            })
+            idx += 1
+    return regions
+
+WAR_REGIONS = build_war_regions()
+WAR_REGIONS_BY_KEY = {r["key"]: r for r in WAR_REGIONS}
+
+
+def war_region_neighbors(key):
+    r = WAR_REGIONS_BY_KEY[key]
+    row, col = r["row"], r["col"]
+    neighbor_keys = []
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nr, nc = row + dr, col + dc
+        if 0 <= nr < WAR_GRID_SIZE and 0 <= nc < WAR_GRID_SIZE:
+            neighbor_keys.append(f"r{nr}c{nc}")
+    return neighbor_keys
+
+
+# رنگ هر بازیکن (چرخشی)، خاکستری = بی‌طرف
+WAR_PLAYER_COLORS = [
+    (220, 60, 60), (60, 120, 220), (60, 180, 90), (230, 180, 40),
+    (170, 70, 200), (240, 130, 40), (40, 190, 190), (220, 90, 160),
+]
+WAR_NEUTRAL_COLOR = (140, 140, 140)
+
+WAR_NEUTRAL_START_TROOPS = 8
+WAR_PLAYER_START_TROOPS = 25
+WAR_TICK_INTERVAL_SECONDS = 90
+WAR_LOBBY_SECONDS = 90
+WAR_MAX_TROOPS_PER_REGION = 400
+WAR_WIN_CONTROL_RATIO = 0.7  # ۷۰٪ نقشه یعنی برد
+
+# =============================================================================
+# نگاشت فارسی کمیابی‌ها - برای دستور «اسپان کارت [کمیابی]» مخصوص ادمین
+# =============================================================================
+RARITY_PERSIAN_MAP = {
+    "کومون": "Common", "کامان": "Common",
+    "آنکامون": "Uncommon", "آن‌کامون": "Uncommon", "آنکومون": "Uncommon",
+    "ریر": "Rare",
+    "اپیک": "Epic",
+    "لجندری": "Legendary", "لجندری": "Legendary",
+    "میتیک": "Mythic",
+    "گاد": "God",
+    "سکرت": "Secret",
+    "اوجی": "OG", "او جی": "OG",
+}
 
 
 # ==============================================================================
@@ -3032,6 +3301,31 @@ async def try_delete_message(bot, chat_id, message_id):
     return False
 
 
+async def safe_send_photo(bot, chat_id, file_path, caption=""):
+    """چون متد دقیق ارسال عکس تو rubka مستند نیست، چندتا اسم محتمل رو
+    امتحان می‌کنیم. اگه هیچ‌کدوم جواب نداد، بجاش کپشن رو به‌صورت متن
+    می‌فرستیم که حداقل بازی متوقف نشه."""
+    for method_name in ("send_photo", "send_image", "send_file", "send_document"):
+        if hasattr(bot, method_name):
+            try:
+                result = await maybe_await(getattr(bot, method_name)(chat_id, file_path, caption=caption))
+                return result
+            except TypeError:
+                try:
+                    result = await maybe_await(getattr(bot, method_name)(chat_id, file_path))
+                    return result
+                except Exception as e:
+                    print(f"خطا در {method_name} (بدون caption):", e)
+            except Exception as e:
+                print(f"خطا در {method_name}:", e)
+    # هیچ متدی جواب نداد؛ حداقل متن رو بفرست تا بازی از کار نیفته
+    try:
+        await maybe_await(bot.send_message(chat_id, caption or "🗺️ (نقشه تولید شد ولی ارسال عکس تو این نسخه‌ی rubka پشتیبانی نشد)"))
+    except Exception as e:
+        print("خطا در ارسال fallback متنی نقشه:", e)
+    return None
+
+
 def is_forwarded_message(message):
     try:
         for attr in ("is_forward", "forwarded", "forward_from"):
@@ -3135,8 +3429,12 @@ async def send_help(reply):
 همگانی [متن] | آمار کلی ربات
 (ریپلای/آیدی) اضافه‌کردن سکه/ایکس‌پی [مقدار] | کم‌کردن سکه/ایکس‌پی [مقدار] | ریست کاربر
 شروع سکه/ایکس‌پی پارتی [مقدار] [مدت] [ضریب] | شروع ادمین ابیوز [مدت] [ضریب] | توقف پارتی
+(ریپلای) «ادمین ربات بشه [رمز]» — ادمین سکه می‌سازه (فقط سکه اضافه/کم می‌کنه)
+اسپان کارت [کمیابی] — کومون/آنکامون/ریر/اپیک/لجندری/میتیک/گاد/سکرت/اوجی
 
-📛 صدام کن با «{BOT_NAME_TRIGGER}» یا «وانتا» هرجای پیامت""")
+📛 صدام کن با «{BOT_NAME_TRIGGER}» یا «وانتا» هرجای پیامت
+
+🔗 گپ اصلی ربات: {GROUP_LINK}""")
 
 
 async def handle_mood_set(reply, uid, text_raw):
@@ -3318,6 +3616,15 @@ def ensure_owner_loadout(uid):
         for item in PENALTY_SHOP.keys():
             add_item(uid, "penalty", item, 1)
 
+    catalog_owned = get_items(uid, "catalog")
+    if len(catalog_owned) < len(RARITY_INFO) - 1:  # OG جدا حساب میشه
+        by_rarity = {}
+        for item in ITEM_CATALOG:
+            by_rarity.setdefault(item["rarity"], []).append(item)
+        for rarity, items in by_rarity.items():
+            for item in items[:3]:  # ۳ تا از هر کمیابی
+                add_item(uid, "catalog", item["name"], 1)
+
 
 def display_name(u, fallback_uid):
     return u.get("display_name") or f"کاربر {fallback_uid[-6:]}"
@@ -3373,10 +3680,20 @@ async def handle_profile(reply, uid, u):
     items = get_items(uid, "shop")
     creatures = get_items(uid, "creature")
     penalty_items = get_items(uid, "penalty")
+    catalog_items = get_items(uid, "catalog")
+    og_items = get_items(uid, "og")
 
     items_txt = "، ".join(f"{i['item_name']}×{i['qty']}" for i in items) or "چیزی نداری"
     creatures_txt = "، ".join(f"{i['item_name']}×{i['qty']}" for i in creatures) or "چیزی نداری"
     penalty_txt = "، ".join(f"{i['item_name']}×{i['qty']}" for i in penalty_items) or "چیزی نداری"
+
+    def _with_rarity(i):
+        cat_item = ITEM_CATALOG_BY_NAME.get(i["item_name"])
+        rarity = f" [{cat_item['rarity']}]" if cat_item else ""
+        return f"{i['item_name']}{rarity}×{i['qty']}"
+
+    catalog_txt = "، ".join(_with_rarity(i) for i in catalog_items) or "هنوز کارتی نداری (از اسپاون یا بازار بگیر)"
+    og_txt = "، ".join(f"{i['item_name']}×{i['qty']}" for i in og_items) or "نداری (فقط یکی تو کل بازیه!)"
 
     await reply(f"""👤 پروفایل تو {emoji}
 
@@ -3392,6 +3709,8 @@ async def handle_profile(reply, uid, u):
 🎒 آیتم‌ها: {items_txt}
 ⚽ آیتم‌های پنالتی: {penalty_txt}
 🐉 موجودات: {creatures_txt}
+🗃️ کارت‌های کلکسیون: {catalog_txt}
+🌟 آیتم OG: {og_txt}
 
 💡 برای شخصی‌سازی: «تنظیم اسم [نام]» یا «تنظیم ایموجی [شکلک]»""")
 
@@ -3785,6 +4104,72 @@ async def handle_stop_party(reply, uid):
 
 
 # =============================================================================
+# 🪙 ادمین سکه - دسترسی محدود، فقط با رمز و فقط از طرف ادمین اصلی
+# =============================================================================
+async def handle_grant_coin_admin(reply, uid, text_raw, reply_sender_uid):
+    if not is_bot_admin(uid):
+        await reply("⛔ فقط ادمین اصلی ربات می‌تونه این کارو بکنه.")
+        return
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای ادمین سکه بشه ریپلای بزنی.")
+        return
+    if COIN_ADMIN_PASSWORD not in text_raw:
+        await reply("❌ رمز اشتباهه یا ننوشتیش. بنویس: (ریپلای) «ادمین ربات بشه [رمز]»")
+        return
+
+    grant_coin_admin(reply_sender_uid, uid)
+    await reply(f"✅ آیدی {reply_sender_uid} الان «ادمین سکه» شد — فقط می‌تونه سکه اضافه/کم کنه، هیچ قدرت دیگه‌ای نداره.")
+
+
+async def handle_revoke_coin_admin(reply, uid, reply_sender_uid):
+    if not is_bot_admin(uid):
+        await reply("⛔ فقط ادمین اصلی ربات می‌تونه این کارو بکنه.")
+        return
+    if not reply_sender_uid:
+        await reply("❌ باید روی پیام کسی که می‌خوای ازش گرفته بشه ریپلای بزنی.")
+        return
+    revoke_coin_admin(reply_sender_uid)
+    await reply(f"✅ دسترسی ادمین سکه از آیدی {reply_sender_uid} گرفته شد.")
+
+
+# =============================================================================
+# 🃏 اسپان دستی کارت - فقط ادمین اصلی، می‌تونه هر کمیابی‌ای بخواد بگیره
+# =============================================================================
+async def handle_admin_spawn_card(reply, uid, text_raw):
+    if not is_bot_admin(uid):
+        await reply("⛔ این دستور فقط برای ادمین اصلی ربات‌ه.")
+        return
+
+
+    rest = text_raw.replace("اسپان کارت", "", 1).replace("اسپون کارت", "", 1).strip()
+    rarity_key = RARITY_PERSIAN_MAP.get(rest)
+    if not rarity_key:
+        options = "، ".join(RARITY_PERSIAN_MAP.keys())
+        await reply(f"بنویس: «اسپان کارت [کمیابی]»\nگزینه‌ها: {options}")
+        return
+
+    if rarity_key == "OG":
+        if get_state("og_claimed", "0") == "1":
+            await reply("❌ آیتم OG قبلاً توسط یکی گرفته شده، دیگه هیچ‌وقت در دسترس نیست.")
+            return
+        add_item(uid, "og", OG_ITEM["name"], 1)
+        add_xp(uid, OG_ITEM["xp"])
+        set_state("og_claimed", "1")
+        await reply(f"🌟👑 آیتم یکتای OG رو برای خودت گرفتی: {OG_ITEM['name']}!\nدیگه هیچ‌وقت این آیتم اسپون نمیشه.")
+        return
+
+    candidates = [item for item in ITEM_CATALOG if item["rarity"] == rarity_key]
+    if not candidates:
+        await reply("❌ آیتمی با این کمیابی پیدا نشد.")
+        return
+
+    item = random.choice(candidates)
+    add_item(uid, "catalog", item["name"], 1)
+    add_xp(uid, item["xp"])
+    await reply(f"🃏 گرفتیش: {item['name']} ({rarity_key})\n💎 ارزش: {item['price']:,} سکه | ✨ +{item['xp']} XP")
+
+
+# =============================================================================
 # ثبت گروه
 # =============================================================================
 async def handle_register_group(reply, chat_id, uid, title=""):
@@ -3925,8 +4310,8 @@ async def handle_unmute(reply, chat_id, uid, reply_sender_uid):
 # فقط ادمین اصلی ربات: سکه دادن با ریپلای یا آیدی مستقیم (رفع باگ اصلی)
 # =============================================================================
 async def handle_add_coins(reply, uid, text_raw, reply_sender_uid):
-    if not is_bot_admin(uid):
-        await reply("⛔ این دستور فقط برای ادمین اصلی ربات‌ه.")
+    if not (is_bot_admin(uid) or is_coin_admin(uid)):
+        await reply("⛔ این دستور فقط برای ادمین اصلی ربات یا ادمین سکه‌ست.")
         return
     rest = text_raw.replace("اضافه کردن سکه", "", 1).strip()
     target_uid = resolve_target_uid(rest, reply_sender_uid)
@@ -3939,8 +4324,8 @@ async def handle_add_coins(reply, uid, text_raw, reply_sender_uid):
 
 
 async def handle_remove_coins(reply, uid, text_raw, reply_sender_uid):
-    if not is_bot_admin(uid):
-        await reply("⛔ این دستور فقط برای ادمین اصلی ربات‌ه.")
+    if not (is_bot_admin(uid) or is_coin_admin(uid)):
+        await reply("⛔ این دستور فقط برای ادمین اصلی ربات یا ادمین سکه‌ست.")
         return
     rest = text_raw.replace("کم کردن سکه", "", 1).strip()
     target_uid = resolve_target_uid(rest, reply_sender_uid)
@@ -5843,6 +6228,15 @@ async def dispatcher(bot: Robot, message: Message):
 
     if text_raw in ("توقف پارتی", "پایان پارتی"):
         await handle_stop_party(reply, uid); return
+
+    if text_raw.startswith("ادمین ربات بشه"):
+        await handle_grant_coin_admin(reply, uid, text_raw, reply_sender_uid); return
+
+    if text_raw == "حذف ادمین سکه" and reply_to_id:
+        await handle_revoke_coin_admin(reply, uid, reply_sender_uid); return
+
+    if text_raw.startswith("اسپان کارت") or text_raw.startswith("اسپون کارت"):
+        await handle_admin_spawn_card(reply, uid, text_raw); return
 
     if text_raw.startswith("همگانی"):
         await handle_broadcast(reply, bot, uid, text_raw); return
