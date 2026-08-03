@@ -269,6 +269,26 @@ def init_db():
                 granted_at INTEGER DEFAULT 0
             )
         """)
+
+        # ---- کیف قاچاق ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS smuggler_opens (
+                uid TEXT PRIMARY KEY,
+                open_count INTEGER DEFAULT 0,
+                last_open_ts INTEGER DEFAULT 0
+            )
+        """)
+
+        # ---- قرعه‌کشی عدد مخفی ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_attempts (
+                round_id INTEGER,
+                uid TEXT,
+                tries_used INTEGER DEFAULT 0,
+                PRIMARY KEY (round_id, uid)
+            )
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_items (
                 uid TEXT,
@@ -476,14 +496,17 @@ def remove_item(uid, category, item_name, qty=1):
 
 def find_owned_item(uid, item_name):
     """این آیتم رو تو هر دسته‌ای که کاربر داشته باشه پیدا می‌کنه (برای هدیه/بازار
-    که کاربر لازم نیست دسته رو بدونه). برمی‌گردونه dict آیتم یا None."""
+    که کاربر لازم نیست دسته رو بدونه). برمی‌گردونه dict آیتم یا None.
+    فاصله‌های اضافه/تکراری رو نادیده می‌گیره تا اگه کاربر یه‌جوری تایپ کرد
+    که فاصله‌هاش با اسم ذخیره‌شده فرق داشت، بازم پیدا بشه."""
     uid = str(uid)
+    query_norm = " ".join(item_name.split())
     cur = read_cursor()
-    row = cur.execute(
-        "SELECT * FROM user_items WHERE uid=? AND item_name=? AND qty>0 LIMIT 1",
-        (uid, item_name),
-    ).fetchone()
-    return dict(row) if row else None
+    rows = cur.execute("SELECT * FROM user_items WHERE uid=? AND qty>0", (uid,)).fetchall()
+    for row in rows:
+        if " ".join(row["item_name"].split()) == query_norm:
+            return dict(row)
+    return None
 
 
 # ============================================================================
@@ -1042,6 +1065,53 @@ def is_coin_admin(uid):
     cur = read_cursor()
     row = cur.execute("SELECT 1 FROM coin_admins WHERE uid=?", (str(uid),)).fetchone()
     return bool(row)
+
+
+# ============================================================================
+# 📦 کیف قاچاق
+# ============================================================================
+def get_smuggler_state(uid):
+    uid = str(uid)
+    cur = read_cursor()
+    row = cur.execute("SELECT * FROM smuggler_opens WHERE uid=?", (uid,)).fetchone()
+    if not row:
+        with write_cursor() as wcur:
+            wcur.execute(
+                "INSERT OR IGNORE INTO smuggler_opens (uid, open_count, last_open_ts) VALUES (?,0,0)",
+                (uid,),
+            )
+        return {"uid": uid, "open_count": 0, "last_open_ts": 0}
+    return dict(row)
+
+
+def record_smuggler_open(uid):
+    get_smuggler_state(uid)
+    with write_cursor() as cur:
+        cur.execute(
+            "UPDATE smuggler_opens SET open_count = open_count + 1, last_open_ts=? WHERE uid=?",
+            (int(time.time()), str(uid)),
+        )
+    return get_smuggler_state(uid)["open_count"]
+
+
+# ============================================================================
+# 🔢 قرعه‌کشی عدد مخفی
+# ============================================================================
+def get_lottery_attempts(round_id, uid):
+    cur = read_cursor()
+    row = cur.execute(
+        "SELECT tries_used FROM lottery_attempts WHERE round_id=? AND uid=?", (round_id, str(uid))
+    ).fetchone()
+    return row["tries_used"] if row else 0
+
+
+def increment_lottery_attempts(round_id, uid):
+    with write_cursor() as cur:
+        cur.execute("""
+            INSERT INTO lottery_attempts (round_id, uid, tries_used) VALUES (?,?,1)
+            ON CONFLICT(round_id, uid) DO UPDATE SET tries_used = tries_used + 1
+        """, (round_id, str(uid)))
+    return get_lottery_attempts(round_id, uid)
 
 
 # ==============================================================================
@@ -3208,6 +3278,26 @@ def normalize(text):
 
 
 # =============================================================================
+# ⏳ ضدِ اسپم - کول‌داون مشترک برای بازی‌ها (هر کاربر، هر بازی، جدا)
+# =============================================================================
+_game_cooldowns = {}
+
+
+def check_game_cooldown(uid, game_key, seconds=120):
+    """اگه کاربر تازه این بازی رو انجام داده، تعداد ثانیه‌ی باقی‌مونده رو
+    برمی‌گردونه (یعنی هنوز باید صبر کنه). اگه مجاز بود، None برمی‌گردونه
+    و خودش کول‌داون رو ثبت می‌کنه."""
+    key = (str(uid), game_key)
+    now = time.time()
+    last = _game_cooldowns.get(key, 0)
+    remaining = seconds - (now - last)
+    if remaining > 0:
+        return remaining
+    _game_cooldowns[key] = now
+    return None
+
+
+# =============================================================================
 # 🎭 اعمال «طعم» مود روی هر پیامی که ربات می‌فرسته (نه فقط سلام/خوبی)
 # =============================================================================
 def apply_mood_flavor(base_text, mood_name):
@@ -3400,9 +3490,11 @@ async def send_help(reply):
 حدس عدد | دوز | مسابقه
 ⚽ پنالتی [چپ/وسط/راست] | فروشگاه پنالتی
 🔫 رولت روسی [مبلغ] (شانس برد فقط ۱٪!)
-🚔 فرار از زندان | 🎭 جرعت حقیقت | 🕵️ دروغ سنج
+🚔 فرار از زندان | 🎭 جرعت حقیقت | 🕵️ دروغ سنج [جمله]
 🗺️ شکار گنج | 🔐 گاوصندوق | 🚔 دزد و پلیس
 ⚔️ دوئل [مبلغ] (با ریپلای)
+📦 کیف قاچاق | خرید کیف قاچاق [شماره] (گرون و پرریسک!)
+🔢 حدس عدد مخفی [عدد] | وضعیت عدد مخفی (جایزه‌ی میلیونی!)
 
 ━━━━━━━━━━━━━━━
 🎉 موقع پارتی («ادمین ابیوز»)
@@ -3430,7 +3522,8 @@ async def send_help(reply):
 (ریپلای/آیدی) اضافه‌کردن سکه/ایکس‌پی [مقدار] | کم‌کردن سکه/ایکس‌پی [مقدار] | ریست کاربر
 شروع سکه/ایکس‌پی پارتی [مقدار] [مدت] [ضریب] | شروع ادمین ابیوز [مدت] [ضریب] | توقف پارتی
 (ریپلای) «ادمین ربات بشه [رمز]» — ادمین سکه می‌سازه (فقط سکه اضافه/کم می‌کنه)
-اسپان کارت [کمیابی] — کومون/آنکامون/ریر/اپیک/لجندری/میتیک/گاد/سکرت/اوجی
+اسپان کارت [کمیابی] — یه اسپون عمومی واقعی راه می‌ندازه (هرکی زودتر «بگیرش» بزنه می‌برتش)
+گزینه‌ها: کومون/آنکامون/ریر/اپیک/لجندری/میتیک/گاد/سکرت/اوجی
 
 📛 صدام کن با «{BOT_NAME_TRIGGER}» یا «وانتا» هرجای پیامت
 
@@ -4133,43 +4226,6 @@ async def handle_revoke_coin_admin(reply, uid, reply_sender_uid):
 
 
 # =============================================================================
-# 🃏 اسپان دستی کارت - فقط ادمین اصلی، می‌تونه هر کمیابی‌ای بخواد بگیره
-# =============================================================================
-async def handle_admin_spawn_card(reply, uid, text_raw):
-    if not is_bot_admin(uid):
-        await reply("⛔ این دستور فقط برای ادمین اصلی ربات‌ه.")
-        return
-
-
-    rest = text_raw.replace("اسپان کارت", "", 1).replace("اسپون کارت", "", 1).strip()
-    rarity_key = RARITY_PERSIAN_MAP.get(rest)
-    if not rarity_key:
-        options = "، ".join(RARITY_PERSIAN_MAP.keys())
-        await reply(f"بنویس: «اسپان کارت [کمیابی]»\nگزینه‌ها: {options}")
-        return
-
-    if rarity_key == "OG":
-        if get_state("og_claimed", "0") == "1":
-            await reply("❌ آیتم OG قبلاً توسط یکی گرفته شده، دیگه هیچ‌وقت در دسترس نیست.")
-            return
-        add_item(uid, "og", OG_ITEM["name"], 1)
-        add_xp(uid, OG_ITEM["xp"])
-        set_state("og_claimed", "1")
-        await reply(f"🌟👑 آیتم یکتای OG رو برای خودت گرفتی: {OG_ITEM['name']}!\nدیگه هیچ‌وقت این آیتم اسپون نمیشه.")
-        return
-
-    candidates = [item for item in ITEM_CATALOG if item["rarity"] == rarity_key]
-    if not candidates:
-        await reply("❌ آیتمی با این کمیابی پیدا نشد.")
-        return
-
-    item = random.choice(candidates)
-    add_item(uid, "catalog", item["name"], 1)
-    add_xp(uid, item["xp"])
-    await reply(f"🃏 گرفتیش: {item['name']} ({rarity_key})\n💎 ارزش: {item['price']:,} سکه | ✨ +{item['xp']} XP")
-
-
-# =============================================================================
 # ثبت گروه
 # =============================================================================
 async def handle_register_group(reply, chat_id, uid, title=""):
@@ -4691,13 +4747,21 @@ async def _handle_truth_dare_input(reply, uid, text_raw):
 # =============================================================================
 # 🕵️ دروغ‌سنج
 # =============================================================================
-async def handle_start_lie_detector(reply, uid):
+async def handle_start_lie_detector(reply, uid, text_raw=""):
+    statement = text_raw.replace("دروغ‌سنج", "", 1).replace("دروغ سنج", "", 1).strip()
+    if statement:
+        await _judge_lie(reply, statement)
+        return
     active_lie.add(uid)
     await reply("🕵️ یه جمله بگو تا دروغ‌سنج بررسیش کنه...")
 
 
 async def _handle_lie_input(reply, uid, text_raw):
     active_lie.discard(uid)
+    await _judge_lie(reply, text_raw)
+
+
+async def _judge_lie(reply, statement):
     percent = random.randint(0, 100)
     if percent >= 70:
         verdict = "😇 کاملاً راست می‌گی!"
@@ -5140,7 +5204,7 @@ def _get_item_rarity_info(item_name):
 
 async def handle_sell(reply, uid, text_raw):
     """فروش [آیتم] [قیمت]"""
-    rest = text_raw.replace("فروش", "", 1).strip()
+    rest = " ".join(text_raw.replace("فروش", "", 1).split())
     price = extract_amount(rest)
     if not price or price <= 0:
         await reply("بنویس: «فروش [اسم آیتم] [قیمت]»")
@@ -5152,7 +5216,7 @@ async def handle_sell(reply, uid, text_raw):
 
     owned = find_owned_item(uid, item_name)
     if not owned:
-        await reply("❌ این آیتم رو نداری که بفروشیش.")
+        await reply("❌ این آیتم رو نداری که بفروشیش. (دقت کن اسمش رو دقیقاً مثل پروفایلت بنویسی)")
         return
 
     removed = remove_item(uid, owned["category"], item_name, 1)
@@ -5694,6 +5758,10 @@ SPAWN_WINDOW_SECONDS = 30          # ۳۰ ثانیه در دسترسه
 _spawn_background_tasks = set()
 
 
+def _is_bot_admin(uid):
+    return str(uid) in {str(a) for a in ADMIN_IDS}
+
+
 def _weighted_catalog_choice():
     """یه آیتم بر اساس وزن کمیابی انتخاب می‌کنه. OG فقط اگه هنوز کسی
     نگرفته باشدش، با شانس خیلی خیلی کم وارد استخر میشه."""
@@ -5762,8 +5830,10 @@ async def handle_spawn_status(reply):
                 f"⏳ {remaining} ثانیه فرصت داری، بنویس «بگیرش»!")
 
 
-async def _do_spawn(bot):
-    item = _weighted_catalog_choice()
+async def _broadcast_and_wait(bot, item):
+    """پیام اسپون رو به همه (پیوی‌ها + گروه‌های ثبت‌شده) می‌فرسته، وضعیت رو
+    تو دیتابیس ثبت می‌کنه، بعد از ۳۰ ثانیه اگه گرفته نشده بود پاکش می‌کنه.
+    این تابع هم برای اسپون خودکار هم برای اسپون دستی ادمین استفاده میشه."""
 
     set_state("spawn_item_name", item["name"])
     set_state("spawn_category", item["category"])
@@ -5774,7 +5844,6 @@ async def _do_spawn(bot):
 
     rarity_label = RARITY_INFO[item["rarity"]]["label"]
 
-    # هم به پیوی کسایی که استارت زدن، هم به همه‌ی گروه‌های ثبت‌شده می‌فرسته
     pv_targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
     group_targets = [g["chat_id"] for g in all_registered_groups()]
     targets = pv_targets + group_targets
@@ -5787,9 +5856,47 @@ async def _do_spawn(bot):
     await rate_limited_broadcast(send_fn, targets, text)
 
     await asyncio.sleep(SPAWN_WINDOW_SECONDS)
-    # اگه هنوزم اسپون فعاله (کسی نگرفته)، پاکش کن
     if get_current_spawn() and get_current_spawn()["name"] == item["name"]:
         clear_spawn()
+
+
+async def _do_spawn(bot):
+    item = _weighted_catalog_choice()
+    await _broadcast_and_wait(bot, item)
+
+
+async def handle_admin_force_spawn(reply, bot, uid, text_raw):
+    """فقط ادمین اصلی: یه اسپون واقعی و عمومی (نه فقط برای خودش) با کمیابی
+    دلخواه راه میندازه؛ هرکی زودتر «بگیرش» رو بزنه می‌بردش."""
+    if not _is_bot_admin(uid):
+        await reply("⛔ این دستور فقط برای ادمین اصلی ربات‌ه.")
+        return
+
+    rest = text_raw.replace("اسپان کارت", "", 1).replace("اسپون کارت", "", 1).strip()
+    rarity_key = RARITY_PERSIAN_MAP.get(rest)
+    if not rarity_key:
+        options = "، ".join(RARITY_PERSIAN_MAP.keys())
+        await reply(f"بنویس: «اسپان کارت [کمیابی]»\nگزینه‌ها: {options}")
+        return
+
+    if get_current_spawn():
+        await reply("❌ الان یه اسپون دیگه فعاله، صبر کن تموم بشه یا کسی بگیرتش.")
+        return
+
+    if rarity_key == "OG":
+        if get_state("og_claimed", "0") == "1":
+            await reply("❌ آیتم OG قبلاً گرفته شده، دیگه هیچ‌وقت اسپون نمیشه.")
+            return
+        item = OG_ITEM
+    else:
+        candidates = [i for i in ITEM_CATALOG if i["rarity"] == rarity_key]
+        if not candidates:
+            await reply("❌ آیتمی با این کمیابی پیدا نشد.")
+            return
+        item = random.choice(candidates)
+
+    await reply(f"📢 اسپون دستی «{item['name']}» ({rarity_key}) برای همه فرستاده شد! {SPAWN_WINDOW_SECONDS} ثانیه فرصت هست.")
+    asyncio.create_task(_broadcast_and_wait(bot, item))
 
 
 async def _spawn_loop(bot):
@@ -5816,12 +5923,274 @@ def start_spawn_loop(bot):
 
 
 # ==============================================================================
-# بخش ۱۵: روتر اصلی و اجرای ربات
+# بخش ۱۵: کیف قاچاق و قرعه‌کشی عدد مخفی
+# ==============================================================================
+# =============================================================================
+# 📦 کیف قاچاق
+# =============================================================================
+SMUGGLER_SLOT_BASE_PRICES = [3000, 6000, 10000, 15000, 22000, 30000, 45000, 65000, 90000, 130000]
+SMUGGLER_OPEN_COOLDOWN_SECONDS = 10 * 60   # هر ۱۰ دقیقه یه‌بار
+SMUGGLER_PROFIT_EVERY = 100                 # هر ۱۰۰ بازکردن، یکیش سود داره
+SMUGGLER_ANNOUNCE_INTERVAL_SECONDS = 10 * 60 * 60  # هر ۱۰ ساعت یادآوری
+
+LOW_VALUE_RARITIES = ["Common", "Uncommon", "Rare"]
+HIGH_VALUE_RARITIES = ["Legendary", "Mythic", "God", "Secret"]
+
+
+def _today_key():
+    return date.today().isoformat()
+
+
+def _ensure_daily_stock():
+    """اگه روز عوض شده باشه، موجودی امروز رو با قیمت‌های تصادفی جدید می‌سازه."""
+    stored_date = get_state("smuggler_stock_date", "")
+    if stored_date == _today_key():
+        return
+    prices = []
+    for base in SMUGGLER_SLOT_BASE_PRICES:
+        multiplier = random.uniform(0.8, 1.4)
+        prices.append(int(base * multiplier))
+    set_state("smuggler_stock_date", _today_key())
+    set_state("smuggler_stock_prices", ",".join(str(p) for p in prices))
+    set_state("smuggler_stock_sold", "")  # شماره‌ی اسلات‌هایی که امروز فروخته شدن
+
+
+def _get_stock():
+    _ensure_daily_stock()
+    prices = [int(p) for p in get_state("smuggler_stock_prices", "").split(",") if p]
+    sold_raw = get_state("smuggler_stock_sold", "")
+    sold = set(int(s) for s in sold_raw.split(",") if s)
+    return prices, sold
+
+
+async def handle_smuggler_list(reply):
+    prices, sold = _get_stock()
+    lines = ["📦 کیف قاچاق — موجودی امروز:\n"]
+    for i, price in enumerate(prices, start=1):
+        status = "❌ فروخته شد" if i in sold else f"{price:,} سکه"
+        lines.append(f"#{i} — {status}")
+    lines.append(f"\n💡 خرید و بازکردن: «خرید کیف قاچاق [شماره]»\n"
+                 f"⚠️ اکثر وقتا ضرر می‌کنی؛ سود بزرگ فقط هر {SMUGGLER_PROFIT_EVERY} بار یه‌بار پیش میاد.\n"
+                 f"⏳ کول‌داون بازکردن: هر {SMUGGLER_OPEN_COOLDOWN_SECONDS // 60} دقیقه یه‌بار")
+    await reply("\n".join(lines))
+
+
+async def handle_smuggler_buy_open(reply, uid, u, text_raw):
+    digits = "".join(ch for ch in text_raw if ch.isdigit())
+    if not digits:
+        await reply("بنویس: «خرید کیف قاچاق [شماره]» — مثلا: خرید کیف قاچاق 3")
+        return
+    slot = int(digits)
+
+    prices, sold = _get_stock()
+    if slot < 1 or slot > len(prices):
+        await reply(f"❌ شماره‌ی نامعتبره. بین ۱ تا {len(prices)} انتخاب کن.")
+        return
+    if slot in sold:
+        await reply("❌ این کیف امروز قبلاً فروخته شده. فردا موجودی جدید میاد.")
+        return
+
+    state = get_smuggler_state(uid)
+    since_last = time.time() - (state["last_open_ts"] or 0)
+    if since_last < SMUGGLER_OPEN_COOLDOWN_SECONDS:
+        wait = int(SMUGGLER_OPEN_COOLDOWN_SECONDS - since_last)
+        await reply(f"⏳ باید {wait // 60} دقیقه و {wait % 60} ثانیه دیگه صبر کنی.")
+        return
+
+    price = prices[slot - 1]
+    if u["coins"] < price:
+        await reply(f"❌ سکه‌ت کافی نیست. این کیف {price:,} سکه‌ست.")
+        return
+
+    sold.add(slot)
+    set_state("smuggler_stock_sold", ",".join(str(s) for s in sorted(sold)))
+
+    remove_coins(uid, price)
+    open_count = record_smuggler_open(uid)
+
+    is_profit_round = (open_count % SMUGGLER_PROFIT_EVERY == 0)
+    rarity_pool = HIGH_VALUE_RARITIES if is_profit_round else LOW_VALUE_RARITIES
+    candidates = [item for item in ITEM_CATALOG if item["rarity"] in rarity_pool]
+    num_cards = random.choice([2, 3])
+    won_items = random.sample(candidates, min(num_cards, len(candidates)))
+
+    total_value = 0
+    total_xp = 0
+    lines = [f"📦 کیف قاچاق رو باز کردی! ({price:,} سکه پرداخت کردی)\n"]
+    for item in won_items:
+        add_item(uid, "catalog", item["name"], 1)
+        total_value += item["price"]
+        total_xp += item["xp"]
+        lines.append(f"🃏 {item['name']} ({item['rarity']}) — ارزش: {item['price']:,} سکه")
+    add_xp(uid, total_xp)
+
+    lines.append(f"\n💎 مجموع ارزش کارت‌ها: {total_value:,} سکه (خریدت: {price:,} سکه)")
+    if total_value > price:
+        lines.append("🎉 سود کردی! پیشنهاد می‌کنم تو بازار سیاه بفروشیشون: «فروش [اسم کارت] [قیمت]»")
+    else:
+        lines.append("😅 این‌بار ضرر کردی، دفعه‌ی بعد شانس بیشتری داری.")
+
+    await reply("\n".join(lines))
+
+
+async def announce_smuggler_bag(bot):
+    """هر چند ساعت یه‌بار یادآوری می‌کنه که کیف قاچاق موجوده."""
+
+    pv_targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
+    group_targets = [g["chat_id"] for g in all_registered_groups()]
+    targets = pv_targets + group_targets
+
+    async def send_fn(chat_id, text):
+        await maybe_await(bot.send_message(chat_id, text))
+
+    text = "📦 کیف قاچاق امروز موجوده! برای دیدن موجودی و قیمت‌ها بنویس: «کیف قاچاق»"
+    await rate_limited_broadcast(send_fn, targets, text)
+
+
+async def smuggler_announce_loop(bot):
+    while True:
+        await asyncio.sleep(SMUGGLER_ANNOUNCE_INTERVAL_SECONDS)
+        try:
+            await announce_smuggler_bag(bot)
+        except Exception as e:
+            print("خطا تو یادآوری کیف قاچاق:", e)
+
+
+# =============================================================================
+# 🔢 قرعه‌کشی عدد مخفی
+# =============================================================================
+LOTTERY_ROUND_SECONDS = 20 * 60 * 60  # هر ۲۰ ساعت
+LOTTERY_MAX_TRIES = 5
+
+
+def _ensure_lottery_round():
+    expires = float(get_state("lottery_expires_ts", "0"))
+    if time.time() < expires and get_state("lottery_secret_number"):
+        return
+    _start_new_lottery_round()
+
+
+def _start_new_lottery_round():
+    range_max = random.randint(1_000_000, 3_000_000)
+    secret = random.randint(1, range_max)
+    prize = random.randint(2, 8) * 1_000_000
+    round_id = int(get_state("lottery_round_id", "0")) + 1
+
+    set_state("lottery_round_id", round_id)
+    set_state("lottery_secret_number", secret)
+    set_state("lottery_range_max", range_max)
+    set_state("lottery_prize", prize)
+    set_state("lottery_expires_ts", time.time() + LOTTERY_ROUND_SECONDS)
+
+
+async def handle_lottery_guess(reply, uid, text_raw):
+    _ensure_lottery_round()
+    digits = "".join(ch for ch in text_raw if ch.isdigit())
+    if not digits:
+        range_max = int(get_state("lottery_range_max", "1000000"))
+        await reply(f"بنویس: «حدس عدد مخفی [عدد]» — عدد بین ۱ تا {range_max:,} ئه.")
+        return
+
+    guess = int(digits)
+    round_id = int(get_state("lottery_round_id"))
+    tries_used = get_lottery_attempts(round_id, uid)
+    if tries_used >= LOTTERY_MAX_TRIES:
+        await reply("❌ شانس‌هات (۵ بار) تو این دوره تموم شده. منتظر دوره‌ی بعدی باش.")
+        return
+
+    tries_used = increment_lottery_attempts(round_id, uid)
+    secret = int(get_state("lottery_secret_number"))
+    remaining = LOTTERY_MAX_TRIES - tries_used
+
+    if guess == secret:
+        prize = int(get_state("lottery_prize"))
+        add_coins(uid, prize)
+        await reply(f"🎉🎉 باورنکردنیه!! درست حدس زدی!! عدد {secret} بود!\n💰 جایزه: {prize:,} سکه!!")
+        _start_new_lottery_round()
+        return
+
+    if remaining <= 0:
+        await reply("❌ اشتباهه، و شانس‌هات هم تموم شد. عدد درست تا دوره‌ی بعد مخفی می‌مونه.")
+        return
+
+    hint = "بزرگ‌تره 🔼" if guess < secret else "کوچیک‌تره 🔽"
+    await reply(f"❌ اشتباهه، {hint} ({remaining} شانس دیگه داری)")
+
+
+async def handle_lottery_status(reply):
+    _ensure_lottery_round()
+    range_max = int(get_state("lottery_range_max"))
+    prize = int(get_state("lottery_prize"))
+    expires = float(get_state("lottery_expires_ts"))
+    remaining_hours = max(0, round((expires - time.time()) / 3600, 1))
+    await reply(f"🔢 قرعه‌کشی عدد مخفی\n"
+                f"محدوده: ۱ تا {range_max:,}\n"
+                f"💰 جایزه: {prize:,} سکه\n"
+                f"⏳ حدود {remaining_hours} ساعت تا تغییر عدد\n"
+                f"بنویس: «حدس عدد مخفی [عدد]» (۵ شانس داری)")
+
+
+async def _lottery_broadcast(bot, text):
+    pv_targets = [u["pv_chat_id"] for u in all_users() if u.get("pv_chat_id")]
+    group_targets = [g["chat_id"] for g in all_registered_groups()]
+    targets = pv_targets + group_targets
+
+    async def send_fn(chat_id, msg):
+        await maybe_await(bot.send_message(chat_id, msg))
+
+    await rate_limited_broadcast(send_fn, targets, text)
+
+
+async def check_and_rollover_lottery(bot):
+    """اگه دوره‌ی فعلی تموم شده باشه، عدد قبلی رو فاش می‌کنه و دوره‌ی
+    جدید رو با اطلاع‌رسانی عمومی شروع می‌کنه."""
+    expires = float(get_state("lottery_expires_ts", "0"))
+    if get_state("lottery_secret_number") and time.time() < expires:
+        return
+
+    old_secret = get_state("lottery_secret_number")
+    _start_new_lottery_round()
+    new_range = get_state("lottery_range_max")
+    new_prize = get_state("lottery_prize")
+
+    if old_secret:
+        text = (f"⌛ دوره‌ی قرعه‌کشی عدد مخفی تموم شد! عدد قبلی «{old_secret}» بود.\n"
+                f"🔢 دوره‌ی جدید شروع شد! محدوده: ۱ تا {new_range:,} | 💰 جایزه: {new_prize:,} سکه\n"
+                f"بنویس: «حدس عدد مخفی [عدد]»")
+    else:
+        text = (f"🔢 قرعه‌کشی عدد مخفی شروع شد! محدوده: ۱ تا {new_range:,} | 💰 جایزه: {new_prize:,} سکه\n"
+                f"بنویس: «حدس عدد مخفی [عدد]» (۵ شانس داری)")
+    await _lottery_broadcast(bot, text)
+
+
+async def lottery_check_loop(bot):
+    while True:
+        await asyncio.sleep(10 * 60)  # هر ۱۰ دقیقه چک می‌کنه
+        try:
+            await check_and_rollover_lottery(bot)
+        except Exception as e:
+            print("خطا تو چک قرعه‌کشی:", e)
+
+
+# ==============================================================================
+# بخش ۱۶: روتر اصلی و اجرای ربات
 # ==============================================================================
 bot = Robot(token=BOT_TOKEN)
 init_db()
 
 _background_jobs_started = False
+
+GAME_COOLDOWN_SECONDS = 120  # هر بازی، هر کاربر، هر ۲ دقیقه یه‌بار (ضد اسپم)
+
+
+async def _gate(reply, uid, game_key):
+    """اگه کاربر تازه این بازی رو زده باشه، پیام کول‌داون می‌ده و False
+    برمی‌گردونه (یعنی دستور نباید اجرا بشه)."""
+    remaining = check_game_cooldown(uid, game_key, GAME_COOLDOWN_SECONDS)
+    if remaining:
+        await reply(f"⏳ آروم‌تر! {int(remaining) + 1} ثانیه‌ی دیگه دوباره امتحان کن.")
+        return False
+    return True
 
 
 async def _periodic_auction_check():
@@ -5861,7 +6230,9 @@ async def dispatcher(bot: Robot, message: Message):
         _background_jobs_started = True
         asyncio.create_task(_spawn_loop(bot))
         asyncio.create_task(_periodic_auction_check())
-        print("✅ کارای پس‌زمینه (اسپاون + چک مزایده) استارت خوردن")
+        asyncio.create_task(smuggler_announce_loop(bot))
+        asyncio.create_task(lottery_check_loop(bot))
+        print("✅ کارای پس‌زمینه (اسپاون + چک مزایده + کیف قاچاق + قرعه‌کشی) استارت خوردن")
 
     dedupe_id = getattr(message, "message_id", None)
     if dedupe_id:
@@ -6029,6 +6400,9 @@ async def dispatcher(bot: Robot, message: Message):
     # =========================================================================
     # ---- بازار سیاه ----
     # =========================================================================
+    if text_raw.startswith("خرید کیف قاچاق"):
+        await handle_smuggler_buy_open(reply, uid, u, text_raw); return
+
     if text_raw.startswith("خرید بازار"):
         await handle_market_buy(reply, uid, u, text_raw); return
     if text_raw.startswith("لغو آگهی"):
@@ -6093,64 +6467,109 @@ async def dispatcher(bot: Robot, message: Message):
 
     # ⚠️ «شکار گنج» باید قبل از «شکار» عمومی چک بشه
     if "شکار گنج" in text_raw:
-        await handle_start_treasure(reply, uid, u); return
+        if await _gate(reply, uid, "treasure"):
+            await handle_start_treasure(reply, uid, u)
+        return
 
     if "شکار" in text_raw:
-        await handle_hunt(reply, uid, u); return
+        if await _gate(reply, uid, "hunt"):
+            await handle_hunt(reply, uid, u)
+        return
 
     if "گاوصندوق" in text_raw:
-        await handle_start_safe(reply, uid, u); return
+        if await _gate(reply, uid, "safe"):
+            await handle_start_safe(reply, uid, u)
+        return
 
     if "دزد و پلیس" in text_raw:
-        await handle_thief_police(reply, uid, u); return
+        if await _gate(reply, uid, "thief"):
+            await handle_thief_police(reply, uid, u)
+        return
 
     if text_raw.startswith("دوئل"):
-        await handle_start_duel(reply, uid, u, text_raw, reply_sender_uid); return
+        if await _gate(reply, uid, "duel"):
+            await handle_start_duel(reply, uid, u, text_raw, reply_sender_uid)
+        return
 
     # =========================================================================
     # ---- بازی‌ها ----
     # =========================================================================
+    if text_raw.startswith("حدس عدد مخفی"):
+        await handle_lottery_guess(reply, uid, text_raw); return
+
+    if "وضعیت عدد مخفی" in text_raw:
+        await handle_lottery_status(reply); return
+
+    if "کیف قاچاق" in text_raw:
+        await handle_smuggler_list(reply); return
+
     if "حدس عدد" in text_raw:
-        await handle_start_guess(reply, uid); return
+        if await _gate(reply, uid, "guess"):
+            await handle_start_guess(reply, uid)
+        return
 
     if text_raw.startswith("رولت روسی"):
-        await handle_roulette(reply, uid, u, text_raw); return
+        if await _gate(reply, uid, "roulette"):
+            await handle_roulette(reply, uid, u, text_raw)
+        return
 
     if "پنالتی" in text_raw:
-        await handle_start_penalty(reply, uid, text_raw); return
+        if await _gate(reply, uid, "penalty"):
+            await handle_start_penalty(reply, uid, text_raw)
+        return
 
     if "فرار از زندان" in text_raw:
-        await handle_start_prison(reply, uid); return
+        if await _gate(reply, uid, "prison"):
+            await handle_start_prison(reply, uid)
+        return
 
     if "جرعت حقیقت" in text_raw or "جرأت حقیقت" in text_raw:
-        await handle_start_truth_dare(reply, uid); return
+        if await _gate(reply, uid, "truthdare"):
+            await handle_start_truth_dare(reply, uid)
+        return
 
     if "دروغ سنج" in text_raw or "دروغ‌سنج" in text_raw:
-        await handle_start_lie_detector(reply, uid); return
+        if await _gate(reply, uid, "liedetector"):
+            await handle_start_lie_detector(reply, uid, text_raw)
+        return
 
     if text_raw == "دوز":
-        await handle_start_tictactoe(reply, uid); return
+        if await _gate(reply, uid, "tictactoe"):
+            await handle_start_tictactoe(reply, uid)
+        return
 
     if "مسابقه" in text_raw:
-        await handle_start_quiz(reply, uid); return
+        if await _gate(reply, uid, "quiz"):
+            await handle_start_quiz(reply, uid)
+        return
 
     if "معما" in text_raw:
-        await handle_riddle(reply); return
+        if await _gate(reply, uid, "riddle"):
+            await handle_riddle(reply)
+        return
 
     if "چالش" in text_raw:
-        await handle_challenge(reply); return
+        if await _gate(reply, uid, "challenge"):
+            await handle_challenge(reply)
+        return
 
     if "جوک" in text_raw:
-        await handle_joke(reply); return
+        if await _gate(reply, uid, "joke"):
+            await handle_joke(reply)
+        return
 
     if "دوز غول" in text_raw:
         await handle_start_giant_tictactoe(reply, uid); return
 
     if "چرخ شانس" in text_raw:
-        await handle_party_wheel(reply, uid); return
+        if await _gate(reply, uid, "wheel"):
+            await handle_party_wheel(reply, uid)
+        return
 
     if "جعبه شانس" in text_raw:
-        await handle_party_box(reply, uid); return
+        if await _gate(reply, uid, "box"):
+            await handle_party_box(reply, uid)
+        return
 
     if "وضعیت پارتی" in text_raw:
         await handle_party_status(reply); return
@@ -6162,16 +6581,24 @@ async def dispatcher(bot: Robot, message: Message):
         await handle_boss_status(reply); return
 
     if text_raw.startswith("شرط"):
-        await handle_bet(reply, uid, u, text_raw); return
+        if await _gate(reply, uid, "bet"):
+            await handle_bet(reply, uid, u, text_raw)
+        return
 
     if "تاس" in text_raw:
-        await handle_dice(reply); return
+        if await _gate(reply, uid, "dice"):
+            await handle_dice(reply)
+        return
 
     if "شانس" in text_raw:
-        await handle_luck(reply); return
+        if await _gate(reply, uid, "luck"):
+            await handle_luck(reply)
+        return
 
     if "فال" in text_raw:
-        await handle_fortune(reply); return
+        if await _gate(reply, uid, "fortune"):
+            await handle_fortune(reply)
+        return
 
     # =========================================================================
     # ---- مدیریت گروه ----
@@ -6236,7 +6663,7 @@ async def dispatcher(bot: Robot, message: Message):
         await handle_revoke_coin_admin(reply, uid, reply_sender_uid); return
 
     if text_raw.startswith("اسپان کارت") or text_raw.startswith("اسپون کارت"):
-        await handle_admin_spawn_card(reply, uid, text_raw); return
+        await handle_admin_force_spawn(reply, bot, uid, text_raw); return
 
     if text_raw.startswith("همگانی"):
         await handle_broadcast(reply, bot, uid, text_raw); return
