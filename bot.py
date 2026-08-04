@@ -1262,6 +1262,55 @@ SHOP_ITEMS = {
     "افسانه‌ی جاودان": 50000,
 }
 
+# =============================================================================
+# 🛒 سوپرمارکت غذا - آیتم‌های خوراکی و نوشیدنی، ارزون‌تر و متنوع‌تر
+# =============================================================================
+SUPERMARKET_ITEMS = {
+    "نان بربری": 20, "نان سنگک": 25, "نان لواش": 15, "نان تافتون": 18,
+    "شیر": 30, "ماست": 28, "پنیر": 45, "کره": 40, "خامه": 35,
+    "تخم مرغ": 25, "روغن مایع": 60, "برنج": 90, "عدس": 55, "لوبیا": 55,
+    "ماکارونی": 40, "رب گوجه": 35, "سس مایونز": 45, "سس کچاپ": 40,
+    "چای": 50, "قهوه": 70, "شکر": 30, "نمک": 15, "فلفل": 20,
+    "سیب‌زمینی": 30, "پیاز": 20, "گوجه فرنگی": 25, "خیار": 22,
+    "سیب": 35, "موز": 40, "پرتقال": 32, "هندوانه": 60, "انگور": 55,
+    "خرما": 65, "کشمش": 40, "آجیل مخلوط": 120, "تخمه آفتابگردان": 30,
+    "پفک نمکی": 25, "چیپس سیب‌زمینی": 35, "بیسکویت": 30, "ویفر": 25,
+    "شکلات تلخ": 45, "شکلات شیری": 40, "آبنبات": 15, "آدامس": 12,
+    "بستنی": 40, "کیک یزدی": 30, "دونات": 35,
+    "نوشابه": 30, "دوغ": 25, "آب معدنی": 15, "آبمیوه": 35, "نوشیدنی انرژی‌زا": 55,
+    "پیتزا آماده": 150, "سوسیس": 60, "کالباس": 55, "همبرگر آماده": 130,
+    "مرغ": 180, "گوشت گوسفند": 260, "گوشت گاو": 240, "ماهی": 150,
+    "میگو": 200, "کباب آماده": 170, "جوجه کباب": 160,
+    "سالاد آماده": 45, "سوپ آماده": 50, "کنسرو تن ماهی": 70, "کنسرو لوبیا": 45,
+    "عسل": 90, "مربا": 50, "کره بادام‌زمینی": 60, "حلوا شکری": 55,
+    "زعفران": 300, "دارچین": 25, "زردچوبه": 20, "ادویه مخلوط": 35,
+}
+
+# =============================================================================
+# 👕 فروشگاه لباس
+# =============================================================================
+CLOTHING_SHOP_ITEMS = {
+    "تیشرت ساده": 150, "شلوار جین": 350, "کاپشن زمستانی": 900,
+    "کفش ورزشی": 600, "کفش چرم": 800, "پیراهن رسمی": 500,
+    "کت شلوار": 2200, "دامن": 400, "مانتو": 700, "شال و روسری": 300,
+    "کلاه بافت": 200, "دستکش چرم": 250, "شال گردن": 220,
+    "کراوات": 180, "کمربند چرم": 260, "ساعت مچی": 1600,
+    "عینک طبی شیک": 500, "کیف دستی": 700, "کوله پشتی": 550,
+    "جوراب طرحدار": 60, "هودی": 480, "سویشرت": 420,
+}
+
+# =============================================================================
+# 🔧 فروشگاه ابزار و الکترونیک
+# =============================================================================
+TOOL_SHOP_ITEMS = {
+    "چکش": 200, "پیچ‌گوشتی": 120, "متر": 90, "چراغ‌قوه": 150,
+    "طناب کوهنوردی": 300, "چاقوی چندکاره": 350, "کوله ابزار": 500,
+    "باتری شارژی": 180, "پاوربانک": 700, "هدفون": 900,
+    "بلندگو بلوتوثی": 1200, "موبایل ساده": 3000, "لپ‌تاپ کارکرده": 15000,
+    "دوربین دیجیتال": 4500, "درایو فلش": 250, "شارژر سریع": 300,
+    "ساعت هوشمند": 3500, "دستگاه تصفیه آب": 2500,
+}
+
 CREATURES = [
     "اژدها 🐉", "ققنوس 🔥", "یونیکورن 🦄", "گرگ 🐺", "عقاب 🦅",
     "ببر 🐯", "کریکن 🐙", "ققنوس یخی ❄️🔥", "گریفین 🦅🦁", "ققنوس سیاه 🖤🔥",
@@ -1406,6 +1455,41 @@ SMALLTALK_EXACT = {
     "آفرین": ["ممنون 😄", "لطف داری!"],
     "عالیه": ["می‌دونستم خوشت میاد 😎", "دقیقا!"],
     "قشنگه": ["ممنون که میگی 🙏", "خوشحالم پسندیدی."],
+    "صبح بخیر": ["صبح توام بخیر ☀️", "سلام، روز خوبی داشته باشی! ☀️"],
+    "شب بخیر": ["شب تو هم بخیر 🌙", "خواب‌های خوب ببینی 🌙✨"],
+    "ظهر بخیر": ["ظهرت هم بخیر باشه 🌤", "نوش جونت، ناهار یادت نره!"],
+    "عصر بخیر": ["عصر توام بخیر 🌇", "روزت چطور بود؟"],
+    "خوشبختم": ["منم همینطور 😊", "خوشحالم آشنا شدیم!"],
+    "کی هستی": ["من ربات وانتا پرسیام 🤖", "یه ربات باحالم که اینجا در خدمتتم 😄"],
+    "تو کی هستی": ["من ربات وانتا پرسیام 🤖", "یه ربات باحالم، بنویس «قابلیت ها» تا بیشتر آشنا شی."],
+    "ربات هوشمندی": ["لطف داری 😄", "دارم تلاشمو می‌کنم 😎"],
+    "باهوشی": ["ممنون، شما لطف داری 😄", "خب یکم که هستم 😎"],
+    "خیلی خفنی": ["ممنون رفیق 🔥", "لطف داری، خودتم خفنی 😎"],
+    "دمت گرم رفیق": ["دمت گرم‌تر 🔥", "خواهش می‌کنم رفیق."],
+    "قربونت": ["قربون تو 🙏", "لطف داری."],
+    "فدات": ["فدای توام 🙏", "لطف داری رفیق."],
+    "میسی": ["خواهش می‌کنم 😊", "قابلی نداشت."],
+    "تشکر": ["خواهش می‌کنم 🙏", "قابل شما رو نداشت."],
+    "اوکیه": ["باشه پس 👍", "اوکی 👌"],
+    "بله": ["خب پس دقیقا همینه 👍", "درسته."],
+    "خیر": ["باشه، هرجور راحتی 🙂", "اوکی، مشکلی نیست."],
+    "درسته": ["دقیقا 👍", "آره کاملا."],
+    "غلطه": ["هوم، بگو ببینم کجاش اشتباهه؟", "شاید، ولی بیشتر توضیح بده."],
+    "جدا": ["آره جدا 😄", "دقیقا همینطوره."],
+    "شوخی میکنی": ["نه جدی میگم 😄", "کاملا جدی‌ام!"],
+    "شوخیته": ["نه بابا جدی میگم 😄", "شوخی نیست، جدیه!"],
+    "چه باحال": ["می‌دونستم خوشت میاد 😄", "دقیقا باحاله!"],
+    "باحاله": ["آره خیلی 😄", "می‌دونستم دوست داری."],
+    "کسشره": ["خب هرجور راحتی 😅", "نظرته دیگه!"],
+    "مسخره": ["😅 نظرت محترمه.", "خب شاید یکم 😄"],
+    "پرسیا جونم": ["جانم؟ 😄", "بله در خدمتم!"],
+    "دوست دارم پرسیا": ["منم رفیقتم 🤝", "لطف داری، منم دوست دارم باهات چت کنم!"],
+    "بریم": ["بریم! 🚀", "آماده‌ام، بگو کجا بریم 😄"],
+    "شروع کنیم": ["بریم شروع کنیم 🔥", "آماده‌ام!"],
+    "تموم شد": ["باشه پس، هروقت خواستی بگو 🙂", "اوکی، هرچی خواستی صدام کن."],
+    "خداحافظی": ["خداحافظ، بازم بیا 👋", "به امید دیدار 🙋"],
+    "فعلا": ["فعلا، بازم بیا 👋", "می‌بینمت 🙋"],
+    "میبینمت": ["می‌بینمت رفیق 👋", "منتظرتم!"],
 }
 
 # کلماتی که ممکنه وسط جمله باشن (substring)، اولویتشون از exact کمتره
@@ -1418,6 +1502,18 @@ SMALLTALK_CONTAINS = {
     "ناراحتم": ["امیدوارم زود بهتر بشی 🙏", "اینجام اگه خواستی حرف بزنیم."],
     "خوشحالم": ["خوشحالیت خوشحالم می‌کنه 😄", "عالیه! چیشده؟"],
     "دوست دارم": ["منم رفیقتم 🤝", "لطف داری رفیق!"],
+    "حوصلم سررفته": ["بنویس «قابلیت ها» یه بازی خفن پیدا کن 😄", "بیا بازی کنیم، «تاس» یا «مسابقه» رو امتحان کن!"],
+    "حوصله ندارم": ["یکم استراحت کن، بعد بیا بازی کنیم 😄", "باشه، هروقت حال داشتی من اینجام."],
+    "دلم میخواد پول دربیارم": ["بنویس «جایزه روزانه» یا «شکار» تا سکه جمع کنی 💰", "بازار سیاه و فروشگاه رو یه نگاه بنداز، شاید سود کنی!"],
+    "کارت میخوام": ["منتظر بمون تا یه آیتم اسپون بشه، بعد بنویس «بگیرش» ⚡", "بنویس «وضعیت اسپاون» تا ببینی الان چیزی هست یا نه."],
+    "چی بخرم": ["بنویس «فروشگاه» یا «سوپرمارکت» تا لیست کامل رو ببینی 🛍️", "یه سر به «فروشگاه لباس» یا «فروشگاه ابزار» هم بزن!"],
+    "سلامتی": ["سلامت باشی 🙏", "به سلامتی تو!"],
+    "خوش اومدی": ["ممنون، خوشحالم اینجام 😄", "لطف داری، دوست دارم اینجا باشم."],
+    "متاسفم": ["اشکالی نداره 🙏", "نگران نباش، مشکلی نیست."],
+    "ببخشید": ["خواهش می‌کنم، مشکلی نیست 🙏", "اشکال نداره اصلا."],
+    "عذر میخوام": ["مشکلی نیست، راحت باش 🙏", "نیازی به عذرخواهی نیست."],
+    "کمکم کن": ["بگو چیکارت می‌تونم بکنم؟ 😄", "حتما، بگو مشکلت چیه."],
+    "خیلی ممنون": ["خواهش می‌کنم 🙏", "قابل شما رو نداشت 😊"],
 }
 
 # =============================================================================
@@ -3467,14 +3563,17 @@ async def send_help(reply):
 💰 اقتصاد
 ━━━━━━━━━━━━━━━
 جایزه روزانه | شکار | شرط [مبلغ] (ریسک بالا!)
-فروشگاه | خرید [آیتم]
+فروشگاه‌ها | فروشگاه | سوپرمارکت | فروشگاه لباس | فروشگاه ابزار
+خرید [آیتم] | خرید سوپرمارکت/لباس/ابزار [آیتم]
 (ریپلای) هدیه سکه/ایکس پی [مقدار] | هدیه آیتم [اسم]
+فروش ایکس پی [مقدار] — تبدیل مستقیم XP به سکه
+فونت [کلمه] — چندتا استایل خفن از یه کلمه می‌سازه
 
 ━━━━━━━━━━━━━━━
 🎒 کلکسیون و اسپاون
 ━━━━━━━━━━━━━━━
 هر ۳۰ دقیقه یه آیتم کمیاب (از Common تا OG یکتا) اسپون میشه!
-وضعیت اسپاون | بگیرش (تو ۳۰ ثانیه اول)
+وضعیت اسپاون | بگیرش (تو ۹۰ ثانیه اول)
 
 ━━━━━━━━━━━━━━━
 🖤 بازار سیاه
@@ -3672,6 +3771,108 @@ def try_calculate(text):
         return f"🧮 نتیجه: {result}"
     except Exception:
         return None
+
+
+# =============================================================================
+# 🔤 فونت‌ساز - از یه کلمه چندتا استایل یونیکد خفن می‌سازه
+# =============================================================================
+def _build_font_map(upper_base=None, lower_base=None, digit_base=None, exceptions=None):
+    m = {}
+    exceptions = exceptions or {}
+    if upper_base is not None:
+        for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+            m[ch] = exceptions.get(ch, chr(upper_base + i))
+    if lower_base is not None:
+        for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+            m[ch] = exceptions.get(ch, chr(lower_base + i))
+    if digit_base is not None:
+        for i, ch in enumerate("0123456789"):
+            m[ch] = chr(digit_base + i)
+    return m
+
+
+def _circled_font_map():
+    m = {}
+    for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+        m[ch] = chr(0x24B6 + i)
+    for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        m[ch] = chr(0x24D0 + i)
+    m["0"] = "\u24EA"
+    for i, ch in enumerate("123456789"):
+        m[ch] = chr(0x2460 + i)
+    return m
+
+
+LATIN_FONT_STYLES = [
+    ("𝗕𝗼𝗹𝗱 (بولد)", _build_font_map(0x1D400, 0x1D41A, 0x1D7CE)),
+    ("𝐼𝑡𝑎𝑙𝑖𝑐 (ایتالیک)", _build_font_map(0x1D434, 0x1D44E, None, {"h": "\u210E"})),
+    ("𝑩𝒐𝒍𝒅 𝑰𝒕𝒂𝒍𝒊𝒄", _build_font_map(0x1D468, 0x1D482)),
+    ("𝒮𝒸𝓇𝒾𝓅𝓉 (اسکریپت)", _build_font_map(0x1D49C, 0x1D4B6, None, {
+        "B": "\u212C", "E": "\u2130", "F": "\u2131", "H": "\u210B", "I": "\u2110",
+        "L": "\u2112", "M": "\u2133", "R": "\u211B", "e": "\u212F", "g": "\u210A", "o": "\u2134",
+    })),
+    ("𝓑𝓸𝓵𝓭 𝓢𝓬𝓻𝓲𝓹𝓽", _build_font_map(0x1D4D0, 0x1D4EA)),
+    ("𝔉𝔯𝔞𝔨𝔱𝔲𝔯", _build_font_map(0x1D504, 0x1D51E, None, {
+        "C": "\u212D", "H": "\u210C", "I": "\u2111", "R": "\u211C", "Z": "\u2128",
+    })),
+    ("𝕭𝖔𝖑𝖉 𝕱𝖗𝖆𝖐𝖙𝖚𝖗", _build_font_map(0x1D56C, 0x1D586)),
+    ("𝔻𝕠𝕦𝕓𝕝𝕖-𝕊𝕥𝕣𝕦𝕔𝕜", _build_font_map(0x1D538, 0x1D552, 0x1D7D8, {
+        "C": "\u2102", "H": "\u210D", "N": "\u2115", "P": "\u2119",
+        "Q": "\u211A", "R": "\u211D", "Z": "\u2124",
+    })),
+    ("𝖲𝖺𝗇𝗌 (ساده)", _build_font_map(0x1D5A0, 0x1D5BA, 0x1D7E2)),
+    ("𝗦𝗮𝗻𝘀 𝗕𝗼𝗹𝗱", _build_font_map(0x1D5D4, 0x1D5EE, 0x1D7EC)),
+    ("𝘚𝘢𝘯𝘴 𝘐𝘵𝘢𝘭𝘪𝘤", _build_font_map(0x1D608, 0x1D622)),
+    ("𝙈𝙤𝙣𝙤𝙨𝙥𝙖𝙘𝙚", _build_font_map(0x1D670, 0x1D68A, 0x1D7F6)),
+    ("Ⓒⓘⓡⓒⓛⓔⓓ", _circled_font_map()),
+    ("Ｆｕｌｌｗｉｄｔｈ", _build_font_map(0xFF21, 0xFF41, 0xFF10)),
+]
+
+
+def _apply_font_map(word, fmap):
+    return "".join(fmap.get(ch, ch) for ch in word)
+
+
+def _is_latin_word(word):
+    if not word:
+        return False
+    return all(ch.isascii() and (ch.isalnum() or ch in " _-") for ch in word)
+
+
+UNIVERSAL_FONT_DECORATIONS = [
+    ("ستاره‌ای", lambda w: f"★彡 {w} 彡★"),
+    ("قلاب", lambda w: f"『{w}』"),
+    ("گیومه", lambda w: f"„{w}“"),
+    ("خط‌دار (زیرخط)", lambda w: "".join(ch + "\u0332" for ch in w)),
+    ("فاصله‌دار", lambda w: " ".join(list(w))),
+    ("موج‌دار", lambda w: f"﹍{w}﹍"),
+    ("رعدی", lambda w: f"⚡{w}⚡"),
+    ("گلی", lambda w: f"🌸{w}🌸"),
+    ("مربعی", lambda w: f"⬛{w}⬛"),
+    ("جعبه‌ای", lambda w: f"「 {w} 」"),
+]
+
+
+async def handle_font(reply, text_raw):
+    """فونت [کلمه] - چندتا استایل خفن از کلمه می‌سازه. اگه کلمه انگلیسی/عددی
+    باشه از فونت‌های واقعی یونیکد استفاده می‌کنه، وگرنه (فارسی و بقیه زبون‌ها)
+    از تزئین‌های یونیورسال استفاده می‌کنه چون یونیکد برای حروف فارسی فونت
+    ریاضی نداره."""
+    word = text_raw.replace("فونت", "", 1).strip()
+    if not word:
+        await reply("بنویس: «فونت [کلمه]» — مثلا «فونت mamad» یا «فونت مثال»")
+        return
+    if len(word) > 40:
+        word = word[:40]
+
+    lines = [f"🔤 فونت‌های «{word}»:\n"]
+    if _is_latin_word(word):
+        for label, fmap in LATIN_FONT_STYLES:
+            lines.append(f"{label}: {_apply_font_map(word, fmap)}")
+    else:
+        for label, fn in UNIVERSAL_FONT_DECORATIONS:
+            lines.append(f"{label}: {fn(word)}")
+    await reply("\n".join(lines))
 
 
 # ==============================================================================
@@ -3912,6 +4113,74 @@ async def handle_buy(reply, uid, u, text_raw):
     remove_coins(uid, price)
     add_item(uid, "shop", match, 1)
     await reply(f"✅ «{match}» رو با {price:,} سکه خریدی! برو تو پروفایلت ببینش.")
+
+
+# =============================================================================
+# 🏬 فروشگاه‌های دیگه (سوپرمارکت / لباس / ابزار) - از یه منطق مشترک استفاده می‌کنن
+# =============================================================================
+async def _shop_list(reply, title, items_dict, buy_hint):
+    lines = [f"{title}\n"]
+    for item, price in items_dict.items():
+        lines.append(f"• {item} — {price:,} سکه")
+    lines.append(f"\n💡 برای خرید بنویس: «{buy_hint} [اسم آیتم]»")
+    await reply("\n".join(lines))
+
+
+async def _shop_buy(reply, uid, u, text_raw, prefix, items_dict, category_tag, not_found_hint):
+    item_name = text_raw.replace(prefix, "", 1).strip()
+    match = next((name for name in items_dict if name == item_name), None)
+    if not match:
+        match = next((name for name in items_dict if item_name and item_name in name), None)
+    if not match:
+        await reply(not_found_hint)
+        return
+
+    price = items_dict[match]
+    if u["coins"] < price:
+        need = price - u["coins"]
+        await reply(f"❌ سکه‌ت کافی نیست. {need:,} سکه‌ی دیگه لازم داری.")
+        return
+
+    remove_coins(uid, price)
+    add_item(uid, category_tag, match, 1)
+    await reply(f"✅ «{match}» رو با {price:,} سکه خریدی! برو تو پروفایلت ببینش.")
+
+
+async def handle_supermarket(reply):
+    await _shop_list(reply, "🛒 سوپرمارکت VANTA 🛒", SUPERMARKET_ITEMS, "خرید سوپرمارکت")
+
+
+async def handle_buy_supermarket(reply, uid, u, text_raw):
+    await _shop_buy(reply, uid, u, text_raw, "خرید سوپرمارکت", SUPERMARKET_ITEMS, "supermarket",
+                     "همچین محصولی تو سوپرمارکت نیست. بنویس «سوپرمارکت» برای دیدن لیست کامل.")
+
+
+async def handle_clothing_shop(reply):
+    await _shop_list(reply, "👕 فروشگاه لباس VANTA 👕", CLOTHING_SHOP_ITEMS, "خرید لباس")
+
+
+async def handle_buy_clothing(reply, uid, u, text_raw):
+    await _shop_buy(reply, uid, u, text_raw, "خرید لباس", CLOTHING_SHOP_ITEMS, "clothing",
+                     "همچین لباسی تو فروشگاه لباس نیست. بنویس «فروشگاه لباس» برای دیدن لیست کامل.")
+
+
+async def handle_tool_shop(reply):
+    await _shop_list(reply, "🔧 فروشگاه ابزار و الکترونیک VANTA 🔧", TOOL_SHOP_ITEMS, "خرید ابزار")
+
+
+async def handle_buy_tool(reply, uid, u, text_raw):
+    await _shop_buy(reply, uid, u, text_raw, "خرید ابزار", TOOL_SHOP_ITEMS, "tools",
+                     "همچین ابزاری تو فروشگاه ابزار نیست. بنویس «فروشگاه ابزار» برای دیدن لیست کامل.")
+
+
+async def handle_shop_list_all(reply):
+    await reply("🏪 فروشگاه‌های VANTA:\n\n"
+                "🏪 «فروشگاه» — آیتم‌های کلکسیونی و افتخاری\n"
+                "🛒 «سوپرمارکت» — خوراکی و نوشیدنی\n"
+                "👕 «فروشگاه لباس» — پوشاک\n"
+                "🔧 «فروشگاه ابزار» — ابزار و الکترونیک\n"
+                "⚽ «فروشگاه پنالتی» | 🔫 «فروشگاه رولت»\n\n"
+                "برای دیدن هرکدوم اسمشو بنویس، مثلا: «سوپرمارکت»")
 
 
 HUNT_SUCCESS_CHANCE = 0.30  # قبلا ۰.۴۵ بود؛ حالا سخت‌تره
@@ -5202,6 +5471,26 @@ def _get_item_rarity_info(item_name):
     return catalog_item["rarity"] if catalog_item else None
 
 
+XP_SELL_RATE = 2  # هر ۱ XP موقع فروش معادل ۲ سکه‌ست
+
+
+async def handle_sell_xp(reply, uid, u, text_raw):
+    """فروش ایکس پی [مقدار] - برخلاف آیتم‌ها، XP مستقیم به سکه تبدیل میشه
+    (نیازی به ثبت آگهی تو بازار سیاه نداره)."""
+    amount = extract_amount(text_raw)
+    if not amount or amount <= 0:
+        await reply(f"بنویس: «فروش ایکس پی [مقدار]»\n(هر ۱ XP = {XP_SELL_RATE} سکه)")
+        return
+    if u["xp"] < amount:
+        await reply("❌ این‌قدر XP نداری.")
+        return
+
+    coins_gained = amount * XP_SELL_RATE
+    update_user(uid, xp=u["xp"] - amount)
+    add_coins(uid, coins_gained)
+    await reply(f"✅ {amount:,} XP رو فروختی و {coins_gained:,} سکه گرفتی!")
+
+
 async def handle_sell(reply, uid, text_raw):
     """فروش [آیتم] [قیمت]"""
     rest = " ".join(text_raw.replace("فروش", "", 1).split())
@@ -5753,7 +6042,7 @@ async def try_handle_duel_accept(reply, uid, u, text_raw):
 # بخش ۱۴: سیستم اسپاون
 # ==============================================================================
 SPAWN_INTERVAL_SECONDS = 30 * 60   # هر ۳۰ دقیقه
-SPAWN_WINDOW_SECONDS = 30          # ۳۰ ثانیه در دسترسه
+SPAWN_WINDOW_SECONDS = 90          # ۹۰ ثانیه در دسترسه (قبلا ۳۰ ثانیه بود، کم بود)
 
 _spawn_background_tasks = set()
 
@@ -5920,6 +6209,53 @@ def start_spawn_loop(bot):
     task = asyncio.create_task(_spawn_loop(bot))
     _spawn_background_tasks.add(task)
     task.add_done_callback(_spawn_background_tasks.discard)
+
+
+# =============================================================================
+# 🕵️ جاسوس مخفی بازار - هر چند وقت یه‌بار (بدون خبر قبلی) میاد و یه آگهی
+# فعال رو تصادفی از بازار سیاه می‌خره، انگار یه خریدار ناشناسه. اینجوری
+# آگهی‌ها هیچ‌وقت برای همیشه راکد نمی‌مونن و فروشنده‌ها هم گاهی غافلگیر میشن.
+# =============================================================================
+SPY_MIN_INTERVAL_HOURS = 9
+SPY_MAX_INTERVAL_HOURS = 10
+
+
+async def _spy_try_buy(bot):
+    try:
+        listings = list_active_listings(limit=50)
+        candidates = [l for l in listings if not l["is_auction"]]
+        if not candidates:
+            return
+        listing = random.choice(candidates)
+        price = listing["price"]
+        tax = int(price * MARKET_TAX_RATE)
+        net_to_seller = price - tax
+
+        add_coins(listing["seller_uid"], net_to_seller)
+        log_transaction(listing["seller_uid"], "spy", listing["item_name"], price, tax)
+        update_listing_status(listing["id"], "sold")
+
+        text = (f"🕵️ یه خریدار مخفی سر و کله‌ش تو بازار سیاه پیدا شد و "
+                f"«{listing['item_name']}» رو با {price:,} سکه خرید!\n"
+                f"💰 آیدی {listing['seller_uid']} پول جنسشو گرفت.")
+
+        group_targets = [g["chat_id"] for g in all_registered_groups()]
+        if group_targets:
+            async def send_fn(chat_id, t):
+                await maybe_await(bot.send_message(chat_id, t))
+            await rate_limited_broadcast(send_fn, group_targets, text)
+    except Exception as e:
+        print("خطا تو خرید جاسوس مخفی بازار:", e)
+
+
+async def _spy_loop(bot):
+    while True:
+        wait_hours = random.uniform(SPY_MIN_INTERVAL_HOURS, SPY_MAX_INTERVAL_HOURS)
+        await asyncio.sleep(wait_hours * 3600)
+        try:
+            await _spy_try_buy(bot)
+        except Exception as e:
+            print("خطا تو حلقه‌ی جاسوس مخفی بازار:", e)
 
 
 # ==============================================================================
@@ -6180,7 +6516,7 @@ init_db()
 
 _background_jobs_started = False
 
-GAME_COOLDOWN_SECONDS = 120  # هر بازی، هر کاربر، هر ۲ دقیقه یه‌بار (ضد اسپم)
+GAME_COOLDOWN_SECONDS = 10  # هر بازی، هر کاربر، هر ۱۰ ثانیه یه‌بار (ضد اسپم، قبلا ۱۲۰ ثانیه بود)
 
 
 async def _gate(reply, uid, game_key):
@@ -6232,7 +6568,8 @@ async def dispatcher(bot: Robot, message: Message):
         asyncio.create_task(_periodic_auction_check())
         asyncio.create_task(smuggler_announce_loop(bot))
         asyncio.create_task(lottery_check_loop(bot))
-        print("✅ کارای پس‌زمینه (اسپاون + چک مزایده + کیف قاچاق + قرعه‌کشی) استارت خوردن")
+        asyncio.create_task(_spy_loop(bot))
+        print("✅ کارای پس‌زمینه (اسپاون + چک مزایده + کیف قاچاق + قرعه‌کشی + جاسوس مخفی بازار) استارت خوردن")
 
     dedupe_id = getattr(message, "message_id", None)
     if dedupe_id:
@@ -6411,7 +6748,11 @@ async def dispatcher(bot: Robot, message: Message):
         await handle_auction(reply, uid, text_raw); return
     if text_raw.startswith("پیشنهاد"):
         await handle_bid(reply, uid, u, text_raw); return
-    if text_raw.startswith("فروش"):
+    if text_raw.startswith("فروش ایکس پی") or text_raw.startswith("فروش اکس پی"):
+        await handle_sell_xp(reply, uid, u, text_raw); return
+    # ⚠️ «فروشگاه» با «فروش» شروع میشه، پس باید حتما مستثنی بشه وگرنه بجای
+    # نشون‌دادن فروشگاه، ربات فکر می‌کنه کاربر می‌خواد بفروشه (باگ قدیمی)
+    if text_raw.startswith("فروش") and not text_raw.startswith("فروشگاه"):
         await handle_sell(reply, uid, text_raw); return
     if "تاریخچه معاملات" in text_raw:
         await handle_market_history(reply, uid); return
@@ -6446,12 +6787,22 @@ async def dispatcher(bot: Robot, message: Message):
     if "جایزه روزانه" in text_raw:
         await handle_daily_reward(reply, uid, u); return
 
-    # ⚠️ فروشگاه‌های اختصاصی (پنالتی/رولت) باید قبل از «خرید» و «فروشگاه» عمومی چک بشن
+    # ⚠️ فروشگاه‌های اختصاصی (پنالتی/رولت/سوپرمارکت/لباس/ابزار) باید قبل از
+    # «خرید» و «فروشگاه» عمومی چک بشن
     if text_raw.startswith("خرید پنالتی"):
         await handle_buy_penalty_item(reply, uid, u, text_raw); return
 
     if text_raw.startswith("خرید رولت"):
         await handle_buy_roulette_item(reply, uid, u, text_raw); return
+
+    if text_raw.startswith("خرید سوپرمارکت"):
+        await handle_buy_supermarket(reply, uid, u, text_raw); return
+
+    if text_raw.startswith("خرید لباس"):
+        await handle_buy_clothing(reply, uid, u, text_raw); return
+
+    if text_raw.startswith("خرید ابزار"):
+        await handle_buy_tool(reply, uid, u, text_raw); return
 
     if text_raw.startswith("خرید"):
         await handle_buy(reply, uid, u, text_raw); return
@@ -6461,6 +6812,18 @@ async def dispatcher(bot: Robot, message: Message):
 
     if "فروشگاه رولت" in text_raw:
         await handle_roulette_shop(reply); return
+
+    if "فروشگاه لباس" in text_raw:
+        await handle_clothing_shop(reply); return
+
+    if "فروشگاه ابزار" in text_raw:
+        await handle_tool_shop(reply); return
+
+    if "سوپرمارکت" in text_raw or "سوپر مارکت" in text_raw:
+        await handle_supermarket(reply); return
+
+    if text_raw in ("فروشگاه ها", "فروشگاه‌ها", "همه فروشگاه ها", "لیست فروشگاه ها"):
+        await handle_shop_list_all(reply); return
 
     if "فروشگاه" in text_raw:
         await handle_shop(reply); return
@@ -6700,6 +7063,9 @@ async def dispatcher(bot: Robot, message: Message):
 
     if "خوبی" in text_raw or "حالت چطوره" in text_raw:
         await handle_how_are_you(reply, u); return
+
+    if text_raw.startswith("فونت"):
+        await handle_font(reply, text_raw); return
 
     calc_result = try_calculate(text_raw)
     if calc_result:
